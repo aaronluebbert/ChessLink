@@ -217,6 +217,7 @@ void checkAccount() {
     if (!deserializeJson(doc, body)) {
       username = String(doc["username"] | "(unknown)");
       screen("Logged in", "as " + username, ST77XX_GREEN);
+      drawMenu(1);
     } else {
       screen("Parse error", "Bad response.", ST77XX_RED);
     }
@@ -261,8 +262,50 @@ void handleCommand(const String& cmd) {
     screen("Cleared", "Saved WiFi + token\ndeleted.\nType 'wifi' to set.", ST77XX_YELLOW);
   } else if (c == "help") {
     printHelp();
-  } else {
+  } else if(c == "w"){
+    drawMenu(1);
+  } else if (c == "s") {
+    drawMenu(2);
+  }else {
     Serial.println("Unknown command. Type 'help'.");
+  }
+}
+
+void drawMenu(int selection) {
+  tft.fillRect(0, 18, tft.width(), 40, ST77XX_RED);
+  tft.setTextSize(3);
+
+  // Project Name 
+  String nm = ("CHESSLINK");
+  tft.setCursor(2, 29);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(nm);
+
+  // Online Play 
+  tft.fillRect(10, 80, tft.width()-20, 20, ST77XX_WHITE);
+  tft.setTextSize(2);
+  String na = ("Local");
+  tft.setCursor(12, 85);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.print(na);
+
+  // Local Play Button 
+  tft.fillRect(10, 120, tft.width()-20, 20, ST77XX_WHITE);
+  tft.setTextSize(2);
+  String nb = ("Online");
+  tft.setCursor(12, 125);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.print(nb);
+
+  // Selection Marker
+  if (selection == 1){
+    tft.drawRect(5, 75, tft.width()-10, 30, ST77XX_YELLOW);
+    tft.drawRect(5, 115, tft.width()-10, 30, ST77XX_BLACK);
+  }else if (selection == 2){
+    tft.drawRect(5, 75, tft.width()-10, 30, ST77XX_BLACK);
+    tft.drawRect(5, 115, tft.width()-10, 30, ST77XX_YELLOW);
+  }else{
+
   }
 }
 
