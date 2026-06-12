@@ -23,6 +23,16 @@ String token;
 String username = "";          // filled after account check
 
 const int STATUS_H = 18;       // height of the top status bar
+int selection = 1;
+bool MENU; 
+bool ONLINE;
+bool LOCAL;
+bool FAME;
+bool LPVP;
+
+
+
+
 
 // ---------- small helpers ----------
 String truncate(const String& s, int maxChars) {
@@ -217,7 +227,7 @@ void checkAccount() {
     if (!deserializeJson(doc, body)) {
       username = String(doc["username"] | "(unknown)");
       screen("Logged in", "as " + username, ST77XX_GREEN);
-      drawMenu(1);
+      drawMenu();
     } else {
       screen("Parse error", "Bad response.", ST77XX_RED);
     }
@@ -262,16 +272,89 @@ void handleCommand(const String& cmd) {
     screen("Cleared", "Saved WiFi + token\ndeleted.\nType 'wifi' to set.", ST77XX_YELLOW);
   } else if (c == "help") {
     printHelp();
+
   } else if(c == "w"){
-    drawMenu(1);
+    if (selection == 2) {
+      if (MENU == true) {
+        selection = 1;
+        drawMenu();
+      } else if (LOCAL == true){
+        selection = 1;
+        drawLocal();
+      }else {
+      }
+    }
+
   } else if (c == "s") {
-    drawMenu(2);
-  }else {
+    if (selection == 1) {
+      if (MENU == true) {
+        selection = 2;
+        drawMenu();
+      } else if (LOCAL == true) {
+        selection = 2;
+        drawLocal();
+      } else if (ONLINE == true) {
+        selection = 2;
+        drawOnline();
+      } else {
+
+      }
+    }else if (selection == 2) {
+      if (MENU == true) {
+        selection = 2;
+        drawMenu();
+      } else if (LOCAL == true){
+        selection = 2;
+        drawLocal();
+      } else if (ONLINE == true) {
+        selection = 3;
+        drawOnline();
+    } else {
+
+      }
+    }  
+  } else if (c == "e") {
+    handleConfirmation();
+  } else if (c == "q") {
+    handleBack();
+  } else {
     Serial.println("Unknown command. Type 'help'.");
   }
 }
 
-void drawMenu(int selection) {
+void handleConfirmation() {
+    if (MENU == true) {
+      if (selection == 1) {
+        drawLocal();
+      } else if (selection == 2) {
+        drawOnline();
+      }
+    } else if (LOCAL == true){
+      if (selection == 1) {
+        drawFame();
+      } else if (selection == 2) {
+        drawLpvp();
+      }
+    }else {
+      
+    }
+  
+}
+
+void handleBack() {
+    if (MENU == true) {
+    } else if (LOCAL == true || ONLINE == true){
+      drawMenu();
+    }else if (FAME == true || LPVP == true) {
+      drawLocal();
+    }else { 
+
+    }
+}
+
+void drawMenu() {
+  tft.fillScreen(ST77XX_BLACK);
+  drawStatusBar();
   tft.fillRect(0, 18, tft.width(), 40, ST77XX_RED);
   tft.setTextSize(3);
 
@@ -281,7 +364,7 @@ void drawMenu(int selection) {
   tft.setTextColor(ST77XX_WHITE);
   tft.print(nm);
 
-  // Online Play 
+  // Local Play 
   tft.fillRect(10, 80, tft.width()-20, 20, ST77XX_WHITE);
   tft.setTextSize(2);
   String na = ("Local");
@@ -289,7 +372,7 @@ void drawMenu(int selection) {
   tft.setTextColor(ST77XX_BLACK);
   tft.print(na);
 
-  // Local Play Button 
+  // Online Button 
   tft.fillRect(10, 120, tft.width()-20, 20, ST77XX_WHITE);
   tft.setTextSize(2);
   String nb = ("Online");
@@ -305,8 +388,154 @@ void drawMenu(int selection) {
     tft.drawRect(5, 75, tft.width()-10, 30, ST77XX_BLACK);
     tft.drawRect(5, 115, tft.width()-10, 30, ST77XX_YELLOW);
   }else{
+  }
+  MENU = true; 
+  ONLINE = false;
+  LOCAL = false;
+  FAME = false; 
+  LPVP = false;
+}
+
+void drawLocal() {
+  tft.fillScreen(ST77XX_BLACK);
+  drawStatusBar();
+  tft.fillRect(0, 18, tft.width(), 40, ST77XX_BLUE);
+  tft.setTextSize(3);
+
+  // Menu Name 
+  String nm = ("Local");
+  tft.setCursor(2, 29);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(nm);
+
+  // Famous Games 
+  tft.fillRect(10, 80, tft.width()-20, 20, ST77XX_WHITE);
+  tft.setTextSize(2);
+  String na = ("Famous Games");
+  tft.setCursor(12, 85);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.print(na);
+
+  // Local Match 
+  tft.fillRect(10, 120, tft.width()-20, 20, ST77XX_WHITE);
+  tft.setTextSize(2);
+  String nb = ("Local Match");
+  tft.setCursor(12, 125);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.print(nb);
+
+    // Selection Marker
+  if (selection == 1){
+    tft.drawRect(5, 75, tft.width()-10, 30, ST77XX_YELLOW);
+    tft.drawRect(5, 115, tft.width()-10, 30, ST77XX_BLACK);
+  }else if (selection == 2){
+    tft.drawRect(5, 75, tft.width()-10, 30, ST77XX_BLACK);
+    tft.drawRect(5, 115, tft.width()-10, 30, ST77XX_YELLOW);
+  }else{
+  }
+
+  MENU = false; 
+  ONLINE = false;
+  LOCAL = true;
+  FAME = false; 
+  LPVP = false;
+}
+
+void drawFame() {
+  tft.fillScreen(ST77XX_BLACK);
+  drawStatusBar();
+  tft.fillRect(0, 18, tft.width(), 40, ST77XX_BLUE);
+  tft.setTextSize(3);
+  // Menu Name 
+  String nm = ("Fame Game");
+  tft.setCursor(2, 29);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(nm);
+
+  MENU = false; 
+  ONLINE = false;
+  LOCAL = false;
+  FAME = true; 
+  LPVP = false;
+}
+
+void drawLpvp() {
+  tft.fillScreen(ST77XX_BLACK);
+  drawStatusBar();
+  tft.fillRect(0, 18, tft.width(), 40, ST77XX_BLUE);
+  tft.setTextSize(3);
+
+  // Menu Name 
+  String nm = ("Loc PVP");
+  tft.setCursor(2, 29);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(nm);
+
+  MENU = false; 
+  ONLINE = false;
+  LOCAL = false;
+  FAME = false; 
+  LPVP = true;
+}
+
+
+void drawOnline(){
+  tft.fillScreen(ST77XX_BLACK);
+  drawStatusBar();
+  tft.fillRect(0, 18, tft.width(), 40, ST77XX_BLUE);
+  tft.setTextSize(3);
+
+  // Menu Name 
+  String nm = ("Online");
+  tft.setCursor(2, 29);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(nm);
+
+  // Bot 
+  tft.fillRect(10, 80, tft.width()-20, 20, ST77XX_WHITE);
+  tft.setTextSize(2);
+  String na = ("Play Bot");
+  tft.setCursor(12, 85);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.print(na);
+
+  // Player
+  tft.fillRect(10, 120, tft.width()-20, 20, ST77XX_WHITE);
+  tft.setTextSize(2);
+  String nb = ("Play Player");
+  tft.setCursor(12, 125);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.print(nb);
+
+  // Ranked
+  tft.fillRect(10, 160, tft.width()-20, 20, ST77XX_WHITE);
+  tft.setTextSize(2);
+  String nc = ("Play Ranked");
+  tft.setCursor(12, 165);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.print(nc);
+
+  if (selection == 1){
+    tft.drawRect(5, 75, tft.width()-10, 30, ST77XX_YELLOW);
+    tft.drawRect(5, 115, tft.width()-10, 30, ST77XX_BLACK);
+    tft.drawRect(5, 155, tft.width()-10, 30, ST77XX_BLACK);
+  }else if (selection == 2){
+    tft.drawRect(5, 75, tft.width()-10, 30, ST77XX_BLACK);
+    tft.drawRect(5, 115, tft.width()-10, 30, ST77XX_YELLOW);
+    tft.drawRect(5, 155, tft.width()-10, 30, ST77XX_BLACK);
+  }else if (selection == 3){
+    tft.drawRect(5, 75, tft.width()-10, 30, ST77XX_BLACK);
+    tft.drawRect(5, 115, tft.width()-10, 30, ST77XX_BLACK);
+    tft.drawRect(5, 155, tft.width()-10, 30, ST77XX_YELLOW);
+  } else { 
 
   }
+
+  MENU = false; 
+  ONLINE = true;
+  LOCAL = false;
+  FAME = false; 
+  LPVP = false;
 }
 
 // ---------- setup ----------
