@@ -1,0 +1,4 @@
+(sym_lib_table
+	(version 7)
+	(lib (name "ChessLink_Footprints") (type "KiCad") (uri "C:/Users/musta/OneDrive/Documents/KiCad/10.0/projects/Microcontroller Lab Summer 2026/ChessLink_lib/ChessLink_Footprints.pretty/ChessLink_ESP_WROOM_32_Devboard.kicad_sym") (options "") (descr ""))
+)
