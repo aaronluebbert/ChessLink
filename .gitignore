@@ -1,0 +1,5 @@
+# KiCad autosaves / lock files
+*.lck
+~*.lck
+*-backups/
+*.history
