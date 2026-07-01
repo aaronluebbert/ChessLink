@@ -90,10 +90,6 @@
           ""
         ],
         [
-          "clearance|121641919|84740000|e5000d86-a3b0-4c52-9440-37811b570438|e9721ac3-54fb-40a4-b92f-550a20057cd0",
-          ""
-        ],
-        [
           "clearance|122091919|122965000|deaee2d7-c039-4d88-b051-995f273dd9af|44203140-3592-4223-85c5-8d791d0c39b4",
           ""
         ],
@@ -742,6 +738,12 @@
           "group_by": false,
           "label": "#",
           "name": "${ITEM_NUMBER}",
+          "show": false
+        },
+        {
+          "group_by": false,
+          "label": "LCSC",
+          "name": "LCSC",
           "show": false
         }
       ],

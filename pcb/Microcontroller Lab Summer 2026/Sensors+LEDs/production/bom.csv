@@ -1,5 +1,5 @@
 ﻿Designator,Footprint,Quantity,Value,LCSC Part #
-"C1, C2, C3, C4, C5, C6, C7, C8, C9",01005,9,0.1uF,C1525
+"C1, C2, C3, C4, C5, C6, C7, C8, C9",0402,9,0.1uF,C1525
 J1,PinHeader_1x02_P2.54mm_Vertical,1,SR_QH_Return,
 J2,PinHeader_1x04_P2.54mm_Vertical,1,Signals_OUT,
 J3,PinHeader_1x04_P2.54mm_Vertical,1,Signals_IN,
