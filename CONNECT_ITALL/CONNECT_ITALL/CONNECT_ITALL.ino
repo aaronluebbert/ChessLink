@@ -16,6 +16,11 @@
 #define TFT_RST   4
 #define TFT_BLK  32
 
+// warm amber for edit highlight (RGB565), in case ST77XX_ORANGE is undefined
+#define CL_AMBER 0xFD20
+#define CL_GREY  0x8410
+#define CL_DGREEN 0x03E0
+
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 Preferences prefs;
 
@@ -73,8 +78,8 @@ const ScreenDef screens[] = {
                      {SCR_FAME, SCR_LPVP, SAME}, SCR_MENU },
 
   /* SCR_ONLINE */ { "Online", ST77XX_BLUE,
-                     {"Play Bot", "Play Player", "Play Ranked"}, 3,
-                     {SCR_Bot, SCR_Player, SCR_Ranked}, SCR_MENU },
+                     {"Play Stockfish", "Play Player", "Play Ranked"}, 3,
+                     {SAME, SCR_Player, SCR_Ranked}, SCR_MENU },
 
   /* SCR_FAME   */ { "Fame Game", ST77XX_BLUE,
                      {"MAGvsGABRIEL", nullptr, nullptr}, 1,
@@ -110,6 +115,8 @@ void drawStatusBar();
 void drawScreen();
 void startPortal();
 void checkAccount();
+bool runStockfishSettings();
+String startAIGame();
 
 // ---------- small helpers ----------
 String truncate(const String& s, int maxChars) {
@@ -282,8 +289,6 @@ void checkAccount() {
 //                       PHONE SETUP PORTAL
 // ====================================================================
 
-// Build the form page. SSID is a typed text field, with scanned
-// networks offered as suggestions via <datalist>.
 String buildPortalPage() {
   int n = WiFi.scanNetworks();
 
@@ -355,7 +360,6 @@ void handleRoot() {
   server.send(200, "text/html", buildPortalPage());
 }
 
-// Tells the phone "got it" before the AP drops, so the page doesn't hang.
 void handleSave() {
   ssid     = server.arg("ssid");
   password = server.arg("pass");
@@ -372,9 +376,9 @@ void handleSave() {
     "<p>The board is joining your network.<br>You can close this page.</p>"
     "</div></body></html>";
   server.send(200, "text/html", done);
-  delay(300);                 // let the response flush to the phone
+  delay(300);
 
-  portalShouldClose = true;   // handled back in the portal loop
+  portalShouldClose = true;
 }
 
 void startPortal() {
@@ -386,10 +390,10 @@ void startPortal() {
   WiFi.softAP(AP_NAME);
   delay(200);
 
-  dns.start(DNS_PORT, "*", WiFi.softAPIP());   // captive portal redirect
+  dns.start(DNS_PORT, "*", WiFi.softAPIP());
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
-  server.onNotFound(handleRoot);               // any URL -> the form
+  server.onNotFound(handleRoot);
   server.begin();
 
   portalActive = true;
@@ -403,14 +407,12 @@ void stopPortal() {
   portalActive = false;
 }
 
-// Runs the portal until the user submits, then connects. Blocks here on purpose.
 void runPortal() {
   startPortal();
   while (!portalShouldClose) {
     dns.processNextRequest();
     server.handleClient();
 
-    // Allow Back button to cancel setup without submitting
     if (digitalRead(bttnbck) == LOW) {
       delay(50);
       stopPortal();
@@ -430,6 +432,228 @@ void runPortal() {
 }
 
 // ====================================================================
+//                    STOCKFISH SETTINGS SCREEN
+// ====================================================================
+
+// ---- game settings the user configures ----
+int    selLevel    = 3;         // Stockfish 1-8
+int    selTimeIdx  = 2;         // index into TIME_PRESETS
+int    selColorIdx = 0;         // 0=white 1=black 2=random
+String selColor    = "white";   // finalized on Play Now
+
+struct TimePreset { int limit; int inc; const char* label; };
+const TimePreset TIME_PRESETS[] = {
+  {  60, 0, "1+0"  },
+  { 180, 0, "3+0"  },
+  { 300, 0, "5+0"  },
+  { 300, 3, "5+3"  },
+  { 600, 0, "10+0" },
+  { 600, 5, "10+5" },
+  { 900,10, "15+10"},
+};
+const int NUM_TIME = sizeof(TIME_PRESETS) / sizeof(TIME_PRESETS[0]);
+
+const char* COLOR_LABELS[] = { "White", "Black", "Random" };
+const char* COLOR_VALUES[] = { "white", "black", "random" };
+
+enum { ROW_LEVEL, ROW_TIME, ROW_COLOR, ROW_START, NUM_ROWS };
+
+int  setCursor = 0;
+bool editing   = false;
+int  editBackup = 0;
+
+void drawSettings() {
+  tft.fillScreen(ST77XX_BLACK);
+  drawStatusBar();
+
+  // Header
+  tft.fillRect(0, STATUS_H, tft.width(), 34, ST77XX_BLUE);
+  tft.setTextSize(2);
+  tft.setCursor(6, STATUS_H + 9);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("Stockfish");
+
+  int top = STATUS_H + 44;
+  int rowH = 34;
+
+  const char* labels[3] = { "Level", "Time", "Color" };
+  String values[3];
+  values[0] = String(selLevel);
+  values[1] = TIME_PRESETS[selTimeIdx].label;
+  values[2] = COLOR_LABELS[selColorIdx];
+
+  for (int r = 0; r < 3; r++) {
+    int y = top + r * rowH;
+    bool active = (setCursor == r);
+    bool isEditingThis = (active && editing);
+
+    // '>' cursor
+    tft.setTextSize(2);
+    tft.setCursor(2, y);
+    tft.setTextColor(active ? ST77XX_YELLOW : ST77XX_BLACK);
+    tft.print(active ? ">" : " ");
+
+    // label
+    tft.setCursor(18, y);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(labels[r]);
+
+    // value (faux-bold + amber while editing)
+    int vx = 105;
+    if (isEditingThis) {
+      tft.setTextColor(CL_AMBER);
+      tft.setCursor(vx + 1, y);
+      tft.print(values[r]);           // 2nd pass -> bold
+      tft.setCursor(vx, y);
+    } else {
+      tft.setTextColor(active ? ST77XX_YELLOW : ST77XX_CYAN);
+      tft.setCursor(vx, y);
+    }
+    tft.print(values[r]);
+  }
+
+  // Start bar
+  int by = tft.height() - 40;
+  bool startActive = (setCursor == ROW_START);
+  uint16_t barCol = startActive ? ST77XX_GREEN : CL_DGREEN;
+  tft.fillRoundRect(10, by, tft.width() - 20, 30, 6, barCol);
+  if (startActive) tft.drawRoundRect(8, by - 2, tft.width() - 16, 34, 7, ST77XX_YELLOW);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(tft.width()/2 - 48, by + 8);
+  tft.print("PLAY NOW");
+
+  // hint
+  tft.setTextSize(1);
+  tft.setTextColor(CL_GREY);
+  tft.setCursor(6, tft.height() - 8);
+  tft.print(editing ? "up/dn adjust  sel ok  back cancel"
+                    : "up/dn move  sel choose  back exit");
+}
+
+void editAdjust(int delta) {
+  switch (setCursor) {
+    case ROW_LEVEL:
+      selLevel += delta;
+      if (selLevel < 1) selLevel = 1;
+      if (selLevel > 8) selLevel = 8;
+      break;
+    case ROW_TIME:
+      selTimeIdx += delta;
+      if (selTimeIdx < 0) selTimeIdx = 0;
+      if (selTimeIdx > NUM_TIME - 1) selTimeIdx = NUM_TIME - 1;
+      break;
+    case ROW_COLOR:
+      selColorIdx += delta;
+      if (selColorIdx < 0) selColorIdx = 0;
+      if (selColorIdx > 2) selColorIdx = 2;
+      break;
+  }
+}
+
+void snapshotRow() {
+  switch (setCursor) {
+    case ROW_LEVEL: editBackup = selLevel;    break;
+    case ROW_TIME:  editBackup = selTimeIdx;  break;
+    case ROW_COLOR: editBackup = selColorIdx; break;
+  }
+}
+void restoreRow() {
+  switch (setCursor) {
+    case ROW_LEVEL: selLevel    = editBackup; break;
+    case ROW_TIME:  selTimeIdx  = editBackup; break;
+    case ROW_COLOR: selColorIdx = editBackup; break;
+  }
+}
+
+// Returns true if user chose PLAY NOW, false if they backed out.
+bool runStockfishSettings() {
+  setCursor = 0;
+  editing = false;
+  drawSettings();
+
+  while (true) {
+    int up = digitalRead(bttnup);
+    int dn = digitalRead(bttndwn);
+    int ok = digitalRead(bttncnfrm);
+    int bk = digitalRead(bttnbck);
+
+    if (pressed(up, bttnupP, tUp)) {
+      if (editing) editAdjust(+1);
+      else { setCursor--; if (setCursor < 0) setCursor = 0; }
+      drawSettings();
+    }
+    if (pressed(dn, bttndwnP, tDwn)) {
+      if (editing) editAdjust(-1);
+      else { setCursor++; if (setCursor > NUM_ROWS - 1) setCursor = NUM_ROWS - 1; }
+      drawSettings();
+    }
+    if (pressed(ok, bttncnfrmP, tCnf)) {
+      if (setCursor == ROW_START) {
+        selColor = COLOR_VALUES[selColorIdx];
+        return true;
+      } else if (editing) {
+        editing = false;              // confirm value
+      } else {
+        snapshotRow();
+        editing = true;               // enter edit mode
+      }
+      drawSettings();
+    }
+    if (pressed(bk, bttnbckP, tBck)) {
+      if (editing) {
+        restoreRow();                 // discard change
+        editing = false;
+        drawSettings();
+      } else {
+        return false;                 // leave screen
+      }
+    }
+    delay(5);
+  }
+}
+
+// ---------- start a game vs Stockfish AI ----------
+// Uses selLevel, selColor, and the chosen time preset.
+// Returns the new game id, or "" on failure.
+String startAIGame() {
+  if (WiFi.status() != WL_CONNECTED) return "";
+
+  int limit = TIME_PRESETS[selTimeIdx].limit;
+  int inc   = TIME_PRESETS[selTimeIdx].inc;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  https.begin(client, "https://lichess.org/api/challenge/ai");
+  https.addHeader("Authorization", String("Bearer ") + token);
+  https.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String body =
+      "level="            + String(selLevel) +
+      "&clock.limit="     + String(limit) +
+      "&clock.increment=" + String(inc) +
+      "&color="           + selColor +
+      "&variant=standard";
+
+  int code = https.POST(body);
+  String resp = https.getString();
+  https.end();
+
+  Serial.printf("AI challenge HTTP %d\n", code);
+  Serial.println(resp);
+
+  if (code == 200 || code == 201) {
+    StaticJsonDocument<3072> doc;
+    if (!deserializeJson(doc, resp)) {
+      return String((const char*)(doc["id"] | ""));
+    }
+  }
+  return "";
+}
+
+// ====================================================================
 //                       LEAF ACTIONS & NAV
 // ====================================================================
 
@@ -437,22 +661,35 @@ void runLeafAction(Screen from, int item) {
   if (from == SCR_SETTINGS) {
     switch (item) {
       case 1: runPortal();   break;   // "Network"
-      // item 2 ("Delete save data") is a submenu (SCR_DELETE), not a leaf
     }
   } else if (from == SCR_DELETE) {
-    if (item == 1) {                  // "Delete"
+    if (item == 1) {
       clearCredentials();
       WiFi.disconnect();
       screen("Deleted", "Saved data cleared.", ST77XX_GREEN);
       delay(1000);
       goToScreen(SCR_SETTINGS);
     }
-    // item 2 ("Go back") is handled as a submenu transition
   } else if (from == SCR_ONLINE) {
-    switch (item) {
-      case 1: Serial.println("[action] Online: Play Bot");    break;
-      case 2: Serial.println("[action] Online: Play Player"); break;
-      case 3: Serial.println("[action] Online: Play Ranked"); break;
+    if (item == 1) {                          // "Play Stockfish"
+      bool go = runStockfishSettings();
+      if (go) {
+        screen("Starting", "Lvl " + String(selLevel) +
+               "   " + TIME_PRESETS[selTimeIdx].label +
+               "\n" + selColor, ST77XX_GREEN);
+        // TODO: uncomment to actually create the game:
+        // String id = startAIGame();
+        // if (id.length())
+        //   screen("Game started", "ID: " + id + "\nCheck lichess.org", ST77XX_GREEN);
+        // else
+        //   screen("Failed", "Could not start.\nSee serial log.", ST77XX_RED);
+        delay(1400);
+      }
+      goToScreen(SCR_ONLINE);
+    } else if (item == 2) {
+      Serial.println("[action] Online: Play Player");
+    } else if (item == 3) {
+      Serial.println("[action] Online: Play Ranked");
     }
   } else if (from == SCR_FAME) {
     Serial.println("[action] Famous game viewer");
@@ -490,7 +727,7 @@ void goBack() {
 bool pressed(int reading, int& prev, unsigned long& tStamp) {
   bool fired = false;
   if (reading != prev && (millis() - tStamp) > DEBOUNCE_MS) {
-    if (reading == LOW) fired = true;     // active-low
+    if (reading == LOW) fired = true;
     prev = reading;
     tStamp = millis();
   }
@@ -505,7 +742,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
-  pinMode(bttnup,    INPUT);   // external pull-ups on these input-only pins
+  pinMode(bttnup,    INPUT);
   pinMode(bttndwn,   INPUT);
   pinMode(bttncnfrm, INPUT);
   pinMode(bttnbck,   INPUT);
@@ -518,7 +755,6 @@ void setup() {
   screen("ChessLink", "Starting up...", ST77XX_YELLOW);
   delay(700);
 
-  // Startup still auto-connects with saved credentials.
   if (loadCredentials()) {
     if (connectWiFi()) checkAccount();
     else screen("Offline", "No connection.\nSettings > Network\nto set up.", ST77XX_YELLOW);
