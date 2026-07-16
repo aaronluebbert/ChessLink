@@ -3,3 +3,18 @@
 ~*.lck
 *-backups/
 *.history
+
+
+# Private credentials
+.env
+secrets.h
+credentials.txt
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
