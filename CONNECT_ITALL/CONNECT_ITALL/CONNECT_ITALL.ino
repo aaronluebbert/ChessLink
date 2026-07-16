@@ -19,6 +19,10 @@
 #define CL_AMBER 0xFD20
 #define CL_GREY  0x8410
 #define CL_DGREEN 0x03E0
+#define CL_DISABLED 0x2124
+#define CL_EDIT   ST77XX_RED     // edit-mode highlight color (was amber)
+#define CL_LIGHTSQ 0xC618        // light board square
+#define CL_DARKSQ  0x5AEB        // dark board square
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 Preferences prefs;
@@ -51,7 +55,7 @@ const unsigned long DEBOUNCE_MS = 30;
 // ---------- navigation state ----------
 enum Screen {
   SCR_MENU, SCR_LOCAL, SCR_ONLINE, SCR_FAME, SCR_LPVP,
-  SCR_Bot, SCR_Player, SCR_Ranked, SCR_SETTINGS, SCR_DELETE
+  SCR_PVP_CAT, SCR_SETTINGS, SCR_DELETE
 };
 const Screen SAME = (Screen)-1;
 
@@ -77,8 +81,8 @@ const ScreenDef screens[] = {
                      {SCR_FAME, SCR_LPVP, SAME}, SCR_MENU },
 
   /* SCR_ONLINE */ { "Online", ST77XX_BLUE,
-                     {"Play Stockfish", "Play Player", "Play Ranked"}, 3,
-                     {SAME, SCR_Player, SCR_Ranked}, SCR_MENU },
+                     {"Play Stockfish", "Play Player", nullptr}, 2,
+                     {SAME, SCR_PVP_CAT, SAME}, SCR_MENU },
 
   /* SCR_FAME   */ { "Fame Game", ST77XX_BLUE,
                      {"MAGvsGABRIEL", nullptr, nullptr}, 1,
@@ -88,17 +92,9 @@ const ScreenDef screens[] = {
                      {nullptr, nullptr, nullptr}, 0,
                      {SAME, SAME, SAME}, SCR_LOCAL },
 
-  /* SCR_Bot   */ { "Bot", ST77XX_BLUE,
-                   {"Finding Match", "Probably", nullptr}, 2,
-                   {SAME, SAME, SAME}, SCR_ONLINE },
-
-  /* SCR_Player*/ { "Casual", ST77XX_BLUE,
-                   {"Is it", "working", nullptr}, 2,
-                   {SAME, SAME, SAME}, SCR_ONLINE },
-
-  /* SCR_Ranked*/ { "Ranked", ST77XX_BLUE,
-                   {"200 ELO", "headass", "play the bot"}, 3,
-                   {SAME, SAME, SAME}, SCR_ONLINE },
+  /* SCR_PVP_CAT*/ { "Find Game", ST77XX_BLUE,
+                     {"Rapid", "Classical", nullptr}, 2,
+                     {SAME, SAME, SAME}, SCR_ONLINE },
 
   /* SCR_SETTINGS*/ { "Settings", ST77XX_BLUE,
                    {"Network", "Delete save data", nullptr}, 2,
@@ -116,6 +112,9 @@ void startPortal();
 void checkAccount();
 bool runStockfishSettings();
 String startAIGame();
+void runFindGame(int category);
+bool pressed(int reading, int& prev, unsigned long& tStamp);
+void playGame(const String& gameId, const String& modeLabel, const String& timeLabel);
 
 // ---------- small helpers ----------
 String truncate(const String& s, int maxChars) {
@@ -460,11 +459,10 @@ int  setCursor = 0;
 bool editing   = false;
 int  editBackup = 0;
 
-// --- layout constants shared by full + partial draws (single source) ---
-const int SET_TOP   = STATUS_H + 44;   // first row y
+const int SET_TOP   = STATUS_H + 44;
 const int SET_ROWH  = 34;
-const int VAL_X     = 105;             // value column x
-const int VAL_W     = 62;              // width of value cell to clear
+const int VAL_X     = 105;
+const int VAL_W     = 62;
 int rowY(int r) { return SET_TOP + r * SET_ROWH; }
 
 String rowValue(int r) {
@@ -473,21 +471,19 @@ String rowValue(int r) {
   return COLOR_LABELS[selColorIdx];
 }
 
-// Draw ONE row's value cell (clears just that cell first). Single source
-// of truth for value rendering — used by both full and partial draws.
 void drawValue(int r) {
   int y = rowY(r);
   bool active = (setCursor == r);
   bool isEditingThis = (active && editing);
 
-  tft.fillRect(VAL_X, y, VAL_W, 16, ST77XX_BLACK);   // erase just this cell
+  tft.fillRect(VAL_X, y, VAL_W, 16, ST77XX_BLACK);
 
   String v = rowValue(r);
   tft.setTextSize(2);
   if (isEditingThis) {
-    tft.setTextColor(CL_AMBER);
+    tft.setTextColor(CL_EDIT);           // RED in edit mode
     tft.setCursor(VAL_X + 1, y);
-    tft.print(v);                 // faux-bold 2nd pass
+    tft.print(v);
   } else {
     tft.setTextColor(active ? ST77XX_YELLOW : ST77XX_CYAN);
   }
@@ -495,31 +491,26 @@ void drawValue(int r) {
   tft.print(v);
 }
 
-// Draw one row's cursor + label (the static-ish left side of the row).
 void drawRowLabel(int r) {
   int y = rowY(r);
   bool active = (setCursor == r);
   const char* labels[3] = { "Level", "Time", "Color" };
 
-  // cursor cell
   tft.fillRect(2, y, 14, 16, ST77XX_BLACK);
   tft.setTextSize(2);
   tft.setCursor(2, y);
   tft.setTextColor(active ? ST77XX_YELLOW : ST77XX_BLACK);
   tft.print(active ? ">" : " ");
 
-  // label
   tft.setCursor(18, y);
   tft.setTextColor(ST77XX_WHITE);
   tft.print(labels[r]);
 }
 
-// Draw the Start bar (its own cell at the bottom).
 void drawStartBar() {
   int by = tft.height() - 40;
   bool startActive = (setCursor == ROW_START);
 
-  // clear a little margin so the highlight outline doesn't leave ghosts
   tft.fillRect(4, by - 4, tft.width() - 8, 40, ST77XX_BLACK);
 
   uint16_t barCol = startActive ? ST77XX_GREEN : CL_DGREEN;
@@ -531,7 +522,6 @@ void drawStartBar() {
   tft.print("PLAY NOW");
 }
 
-// Draw the bottom hint line (changes with mode).
 void drawHint() {
   tft.fillRect(0, tft.height() - 10, tft.width(), 10, ST77XX_BLACK);
   tft.setTextSize(1);
@@ -541,7 +531,6 @@ void drawHint() {
                     : "up/dn move  sel choose  back exit");
 }
 
-// Full redraw — used on entry, cursor moves, and mode changes.
 void drawSettings() {
   tft.fillScreen(ST77XX_BLACK);
   drawStatusBar();
@@ -591,12 +580,10 @@ void restoreRow() {
   switch (setCursor) {
     case ROW_LEVEL: selLevel    = editBackup; break;
     case ROW_TIME:  selTimeIdx  = editBackup; break;
-    case ROW_COLOR: editBackup = editBackup;  break;  // no-op guard
+    case ROW_COLOR: selColorIdx = editBackup; break;
   }
-  if (setCursor == ROW_COLOR) selColorIdx = editBackup;
 }
 
-// Returns true if user chose PLAY NOW, false if they backed out.
 bool runStockfishSettings() {
   setCursor = 0;
   editing = false;
@@ -611,12 +598,11 @@ bool runStockfishSettings() {
     if (pressed(up, bttnupP, tUp)) {
       if (editing) {
         editAdjust(+1);
-        drawValue(setCursor);        // <-- partial: only the value cell
+        drawValue(setCursor);
       } else {
         int prev = setCursor;
         setCursor--; if (setCursor < 0) setCursor = 0;
         if (setCursor != prev) {
-          // repaint only the two affected rows' cursor cells + start bar
           drawRowLabel(prev); if (prev < 3) drawValue(prev);
           if (setCursor < 3) { drawRowLabel(setCursor); drawValue(setCursor); }
           drawStartBar();
@@ -626,7 +612,7 @@ bool runStockfishSettings() {
     if (pressed(dn, bttndwnP, tDwn)) {
       if (editing) {
         editAdjust(-1);
-        drawValue(setCursor);        // <-- partial
+        drawValue(setCursor);
       } else {
         int prev = setCursor;
         setCursor++; if (setCursor > NUM_ROWS - 1) setCursor = NUM_ROWS - 1;
@@ -643,12 +629,12 @@ bool runStockfishSettings() {
         return true;
       } else if (editing) {
         editing = false;
-        drawValue(setCursor);        // value returns to normal color
+        drawValue(setCursor);
         drawHint();
       } else {
         snapshotRow();
         editing = true;
-        drawValue(setCursor);        // value turns amber/bold
+        drawValue(setCursor);
         drawHint();
       }
     }
@@ -656,7 +642,7 @@ bool runStockfishSettings() {
       if (editing) {
         restoreRow();
         editing = false;
-        drawValue(setCursor);        // revert + normal color
+        drawValue(setCursor);
         drawHint();
       } else {
         return false;
@@ -666,7 +652,7 @@ bool runStockfishSettings() {
   }
 }
 
-// ---------- start a game vs Stockfish AI ----------
+// ---------- start a game vs Stockfish AI; returns game id ----------
 String startAIGame() {
   if (WiFi.status() != WL_CONNECTED) return "";
 
@@ -705,6 +691,506 @@ String startAIGame() {
 }
 
 // ====================================================================
+//                 PLAY PLAYER — FIND GAME (Board seek)
+//   Board API supports RAPID and CLASSICAL only (no bullet/blitz).
+// ====================================================================
+
+struct SeekPreset { int minutes; int inc; const char* label; };
+
+const SeekPreset RAPID[] = {
+  {10,0,"10+0"}, {10,5,"10+5"}, {15,10,"15+10"},
+};
+const SeekPreset CLASSICAL[] = {
+  {30,0,"30+0"}, {30,20,"30+20"},
+};
+
+const SeekPreset* CAT_LIST[2]  = { RAPID, CLASSICAL };
+const int         CAT_COUNT[2] = { 3, 2 };
+const char*       CAT_NAME[2]  = { "Rapid", "Classical" };
+
+// Fire a Board seek. time in MINUTES, increment in SECONDS. Random color.
+bool startSeek(int minutes, int inc) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  https.begin(client, "https://lichess.org/api/board/seek");
+  https.addHeader("Authorization", String("Bearer ") + token);
+  https.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String body =
+      "rated=false"
+      "&time="      + String(minutes) +
+      "&increment=" + String(inc) +
+      "&variant=standard";
+
+  int code = https.POST(body);
+  String resp = https.getString();
+  https.end();
+
+  Serial.printf("Board seek HTTP %d\n", code);
+  Serial.println(resp);
+
+  return (code == 200 || code == 201);
+}
+
+void drawFindList(int category, int cursor, int chosen) {
+  tft.fillScreen(ST77XX_BLACK);
+  drawStatusBar();
+
+  tft.fillRect(0, STATUS_H, tft.width(), 34, ST77XX_BLUE);
+  tft.setTextSize(2);
+  tft.setCursor(6, STATUS_H + 9);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(CAT_NAME[category]);
+
+  int n = CAT_COUNT[category];
+  const SeekPreset* list = CAT_LIST[category];
+
+  int top = STATUS_H + 44;
+  int rowH = 26;
+  for (int i = 0; i < n; i++) {
+    int y = top + i * rowH;
+    bool active   = (cursor == i);
+    bool isChosen = (chosen == i);
+
+    if (isChosen) {
+      tft.fillRoundRect(18, y - 3, tft.width() - 40, 22, 4, CL_DGREEN);
+    }
+
+    tft.setTextSize(2);
+    tft.setCursor(2, y);
+    tft.setTextColor(active ? ST77XX_YELLOW : ST77XX_BLACK);
+    tft.print(active ? ">" : " ");
+
+    tft.setCursor(24, y);
+    if (isChosen)     tft.setTextColor(ST77XX_WHITE);
+    else if (active)  tft.setTextColor(ST77XX_YELLOW);
+    else              tft.setTextColor(ST77XX_CYAN);
+    tft.print(list[i].label);
+  }
+
+  int by = tft.height() - 40;
+  bool goActive = (cursor == n);
+  bool ready    = (chosen >= 0);
+  uint16_t barCol;
+  if (!ready)  barCol = CL_DISABLED;
+  else         barCol = goActive ? ST77XX_GREEN : CL_DGREEN;
+
+  tft.fillRoundRect(10, by, tft.width() - 20, 30, 6, barCol);
+  if (goActive && ready) tft.drawRoundRect(8, by - 2, tft.width() - 16, 34, 7, ST77XX_YELLOW);
+  tft.setTextSize(2);
+  tft.setTextColor(ready ? ST77XX_BLACK : CL_GREY);
+  tft.setCursor(tft.width()/2 - 54, by + 8);
+  tft.print("FIND GAME");
+
+  tft.setTextSize(1);
+  tft.setTextColor(CL_GREY);
+  tft.setCursor(6, tft.height() - 8);
+  tft.print(chosen < 0 ? "sel to choose a time first"
+                       : "up/dn move   sel ok   back exit");
+}
+
+void runFindGame(int category) {
+  int n = CAT_COUNT[category];
+  int cursor = 0;
+  int chosen = -1;
+  drawFindList(category, cursor, chosen);
+
+  while (true) {
+    int up = digitalRead(bttnup);
+    int dn = digitalRead(bttndwn);
+    int ok = digitalRead(bttncnfrm);
+    int bk = digitalRead(bttnbck);
+
+    if (pressed(up, bttnupP, tUp)) {
+      cursor--; if (cursor < 0) cursor = 0;
+      drawFindList(category, cursor, chosen);
+    }
+    if (pressed(dn, bttndwnP, tDwn)) {
+      cursor++; if (cursor > n) cursor = n;
+      drawFindList(category, cursor, chosen);
+    }
+    if (pressed(ok, bttncnfrmP, tCnf)) {
+      if (cursor == n) {
+        if (chosen >= 0) {
+          const SeekPreset& p = CAT_LIST[category][chosen];
+          if (WiFi.status() != WL_CONNECTED) {
+            screen("No WiFi", "Connect first via\nSettings > Network.", ST77XX_RED);
+            delay(1400);
+            drawFindList(category, cursor, chosen);
+          } else {
+            screen("Searching", String(CAT_NAME[category]) + "  " + p.label +
+                   "\n\nSeeking a random\nopponent...\n\n(Game-start detect\nis a TODO: watch\nlichess.org)", ST77XX_YELLOW);
+            bool okSeek = startSeek(p.minutes, p.inc);
+            if (okSeek) {
+              screen("Seek sent", "Waiting for a\nmatch on " + String(p.label) +
+                     "\n\nGame appears on\nlichess.org", ST77XX_GREEN);
+              delay(2500);
+            } else {
+              screen("Seek failed", "Lichess refused.\nSee serial log.", ST77XX_RED);
+              delay(2000);
+            }
+            return;
+          }
+        }
+      } else {
+        chosen = cursor;
+        drawFindList(category, cursor, chosen);
+      }
+    }
+    if (pressed(bk, bttnbckP, tBck)) {
+      return;
+    }
+    delay(5);
+  }
+}
+
+// ====================================================================
+//                        IN-GAME SCREEN
+// ====================================================================
+// Maintains an 8x8 board model, applies UCI moves from the game stream,
+// renders players/ratings/board, and offers Abort / Resign / Draw.
+
+// Board model: uppercase = white, lowercase = black, '.' = empty.
+char board[8][8];
+
+// Game info parsed from the stream
+String gWhiteName = "?", gBlackName = "?";
+int    gWhiteRating = 0, gBlackRating = 0;
+bool   gIAmWhite = true;         // is the logged-in user White?
+String gModeLabel = "", gTimeLabel = "";
+String gStatus = "started";      // started, mate, resign, draw, aborted...
+String lastMovesApplied = "";    // to detect new moves
+
+// selection among the 3 action buttons
+int gBtn = 0;                    // 0=Abort 1=Resign 2=Draw
+
+void boardInit() {
+  const char* back = "rnbqkbnr";
+  for (int c = 0; c < 8; c++) {
+    board[0][c] = back[c];        // rank 8 (black back rank), row 0 = top
+    board[1][c] = 'p';
+    for (int r = 2; r < 6; r++) board[r][c] = '.';
+    board[6][c] = 'P';
+    board[7][c] = (char)toupper(back[c]);
+  }
+}
+
+// Convert a UCI square like "e2" to row/col in our array (row 0 = rank 8).
+void sqToRC(const String& sq, int& r, int& c) {
+  c = sq.charAt(0) - 'a';
+  int rank = sq.charAt(1) - '1';      // 0..7 where 0 = rank 1
+  r = 7 - rank;                       // row 0 = rank 8
+}
+
+// Apply one UCI move (e.g. "e2e4", "e7e8q", "e1g1" castle) to the board.
+void applyUci(const String& mv) {
+  if (mv.length() < 4) return;
+  int fr, fc, tr, tc;
+  sqToRC(mv.substring(0, 2), fr, fc);
+  sqToRC(mv.substring(2, 4), tr, tc);
+  char piece = board[fr][fc];
+
+  // en passant: pawn moves diagonally to an empty square
+  if ((piece == 'P' || piece == 'p') && fc != tc && board[tr][tc] == '.') {
+    board[fr][tc] = '.';              // captured pawn is on from-row, to-col
+  }
+
+  // castling: king moves two files -> move the rook too
+  if (piece == 'K' || piece == 'k') {
+    if (fc == 4 && tc == 6) {         // king side
+      board[tr][5] = board[tr][7]; board[tr][7] = '.';
+    } else if (fc == 4 && tc == 2) {  // queen side
+      board[tr][3] = board[tr][0]; board[tr][0] = '.';
+    }
+  }
+
+  board[tr][tc] = piece;
+  board[fr][fc] = '.';
+
+  // promotion: 5th char is the new piece
+  if (mv.length() >= 5) {
+    char promo = mv.charAt(4);
+    board[tr][tc] = (piece == 'P') ? (char)toupper(promo) : (char)tolower(promo);
+  }
+}
+
+// Rebuild the board from the full move list (space-separated UCI).
+void applyMoveList(const String& moves) {
+  boardInit();
+  int start = 0;
+  while (start < moves.length()) {
+    int sp = moves.indexOf(' ', start);
+    String mv = (sp < 0) ? moves.substring(start) : moves.substring(start, sp);
+    mv.trim();
+    if (mv.length() >= 4) applyUci(mv);
+    if (sp < 0) break;
+    start = sp + 1;
+  }
+}
+
+// ---------- drawing the game screen ----------
+const int BOARD_PX = 160;                 // 8 * 20
+const int SQ = BOARD_PX / 8;              // 20
+int boardTop;                             // computed in layout
+
+// piece letter color: white pieces bright, black pieces dark
+void drawPieceLetter(int r, int c) {
+  char p = board[r][c];
+  if (p == '.') return;
+  int x = 5 + c * SQ;
+  int y = boardTop + r * SQ;
+  bool whitePiece = (p >= 'A' && p <= 'Z');
+  char letter = (char)toupper(p);
+  tft.setTextSize(2);
+  // outline-ish: draw dark behind for contrast then the letter
+  tft.setTextColor(whitePiece ? ST77XX_WHITE : ST77XX_BLACK);
+  tft.setCursor(x + 4, y + 3);
+  tft.print(letter);
+}
+
+void drawBoard() {
+  for (int r = 0; r < 8; r++) {
+    for (int c = 0; c < 8; c++) {
+      int x = 5 + c * SQ;
+      int y = boardTop + r * SQ;
+      uint16_t sqcol = ((r + c) % 2 == 0) ? CL_LIGHTSQ : CL_DARKSQ;
+      tft.fillRect(x, y, SQ, SQ, sqcol);
+      drawPieceLetter(r, c);
+    }
+  }
+  tft.drawRect(5, boardTop, BOARD_PX, BOARD_PX, ST77XX_WHITE);
+}
+
+void drawPlayers() {
+  // opponent row (top) and me row (bottom of info area)
+  int oppTop = STATUS_H + 2;
+  int oppRating = gIAmWhite ? gBlackRating : gWhiteRating;
+  String oppName = gIAmWhite ? gBlackName : gWhiteName;
+  int myRating  = gIAmWhite ? gWhiteRating : gBlackRating;
+  String myName = gIAmWhite ? gWhiteName : gBlackName;
+
+  // opponent line
+  tft.fillRect(0, oppTop, tft.width(), 12, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_RED);
+  tft.setCursor(2, oppTop + 2);
+  tft.print(truncate(oppName, 16));
+  String orat = String(oppRating);
+  tft.setCursor(tft.width() - orat.length()*6 - 2, oppTop + 2);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(orat);
+
+  // mode + time line
+  int infoTop = oppTop + 12;
+  tft.fillRect(0, infoTop, tft.width(), 12, ST77XX_BLACK);
+  tft.setTextColor(CL_GREY);
+  tft.setCursor(2, infoTop + 2);
+  tft.print(gModeLabel + "  " + gTimeLabel);
+
+  // my line (just under the board)
+  int myTop = boardTop + BOARD_PX + 2;
+  tft.fillRect(0, myTop, tft.width(), 12, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(2, myTop + 2);
+  tft.print(truncate(myName, 16));
+  String mrat = String(myRating);
+  tft.setCursor(tft.width() - mrat.length()*6 - 2, myTop + 2);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(mrat);
+}
+
+void drawActionButtons() {
+  int by = tft.height() - 34;
+  const char* labels[3] = { "Abort", "Resign", "Draw" };
+  int bw = (tft.width() - 8) / 3;
+  for (int i = 0; i < 3; i++) {
+    int x = 2 + i * bw;
+    bool active = (gBtn == i);
+    uint16_t bg = active ? ST77XX_YELLOW : 0x2124;
+    tft.fillRoundRect(x + 1, by, bw - 2, 28, 4, bg);
+    tft.setTextSize(1);
+    tft.setTextColor(active ? ST77XX_BLACK : ST77XX_WHITE);
+    int tw = strlen(labels[i]) * 6;
+    tft.setCursor(x + (bw - tw)/2, by + 10);
+    tft.print(labels[i]);
+  }
+}
+
+void drawGameScreen() {
+  tft.fillScreen(ST77XX_BLACK);
+  drawStatusBar();
+  drawPlayers();
+  drawBoard();
+  drawActionButtons();
+}
+
+// ---------- game action POSTs ----------
+bool gameAction(const String& gameId, const String& path) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  https.begin(client, "https://lichess.org/api/board/game/" + gameId + "/" + path);
+  https.addHeader("Authorization", String("Bearer ") + token);
+  int code = https.POST("");
+  String resp = https.getString();
+  https.end();
+  Serial.printf("action %s -> HTTP %d\n", path.c_str(), code);
+  Serial.println(resp);
+  return (code == 200);
+}
+
+// Parse a gameFull / gameState json line and update model. Returns true if
+// something changed that needs a redraw.
+bool handleStreamLine(const String& line) {
+  if (line.length() < 2) return false;
+  StaticJsonDocument<4096> doc;
+  DeserializationError err = deserializeJson(doc, line);
+  if (err) { Serial.println("json err in stream line"); return false; }
+
+  const char* type = doc["type"] | "";
+
+  if (strcmp(type, "gameFull") == 0) {
+    gWhiteName   = String((const char*)(doc["white"]["name"] | doc["white"]["id"] | "White"));
+    gBlackName   = String((const char*)(doc["black"]["name"] | doc["black"]["id"] | "Black"));
+    gWhiteRating = doc["white"]["rating"] | 0;
+    gBlackRating = doc["black"]["rating"] | 0;
+    // am I white? compare my username to white name (case-insensitive-ish)
+    String wl = gWhiteName; wl.toLowerCase();
+    String un = username;   un.toLowerCase();
+    gIAmWhite = (wl == un);
+    String moves = String((const char*)(doc["state"]["moves"] | ""));
+    applyMoveList(moves);
+    lastMovesApplied = moves;
+    gStatus = String((const char*)(doc["state"]["status"] | "started"));
+    return true;
+  }
+  else if (strcmp(type, "gameState") == 0) {
+    String moves = String((const char*)(doc["moves"] | ""));
+    if (moves != lastMovesApplied) {
+      applyMoveList(moves);
+      lastMovesApplied = moves;
+    }
+    gStatus = String((const char*)(doc["status"] | "started"));
+    return true;
+  }
+  return false;
+}
+
+// Main in-game routine: opens the game stream, renders, handles buttons.
+void playGame(const String& gameId, const String& modeLabel, const String& timeLabel) {
+  gModeLabel = modeLabel;
+  gTimeLabel = timeLabel;
+  gBtn = 0;
+  boardInit();
+  lastMovesApplied = "";
+
+  // layout
+  boardTop = STATUS_H + 28;
+
+  // loading screen
+  screen("Loading", "Opening game...\n" + gameId, ST77XX_YELLOW);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  if (!client.connect("lichess.org", 443)) {
+    screen("Stream fail", "Couldn't open\ngame stream.", ST77XX_RED);
+    delay(1500);
+    return;
+  }
+
+  // Send the streaming GET request manually so we can read line-by-line.
+  String req =
+      "GET /api/board/game/stream/" + gameId + " HTTP/1.1\r\n"
+      "Host: lichess.org\r\n"
+      "Authorization: Bearer " + token + "\r\n"
+      "Accept: application/x-ndjson\r\n"
+      "Connection: keep-alive\r\n\r\n";
+  client.print(req);
+
+  // Skip HTTP response headers (until blank line)
+  unsigned long hstart = millis();
+  while (client.connected()) {
+    String h = client.readStringUntil('\n');
+    if (h == "\r" || h.length() == 0) break;
+    if (millis() - hstart > 8000) break;
+  }
+
+  bool drawn = false;
+  unsigned long lastData = millis();
+
+  while (true) {
+    // read any available ndjson lines
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      lastData = millis();
+      if (line.length() > 0) {
+        if (handleStreamLine(line)) {
+          drawGameScreen();
+          drawn = true;
+        }
+      }
+    }
+
+    if (!drawn && millis() - lastData > 1500) {
+      // still waiting on first data
+      screen("Loading", "Waiting for game\ndata...\n" + gameId, ST77XX_YELLOW);
+      drawn = false;
+      lastData = millis();
+    }
+
+    // stream ended / game over?
+    if (gStatus != "started" && gStatus != "created" && drawn) {
+      drawGameScreen();
+      tft.setTextSize(2);
+      tft.setTextColor(ST77XX_YELLOW);
+      tft.setCursor(10, boardTop + BOARD_PX/2 - 8);
+      tft.print(gStatus);
+      delay(2500);
+      break;
+    }
+
+    if (!client.connected()) {
+      // stream closed by server (game ended)
+      break;
+    }
+
+    // ---- buttons ----
+    int lft = digitalRead(bttnup);     // up  = move selection left
+    int rgt = digitalRead(bttndwn);    // down= move selection right
+    int ok  = digitalRead(bttncnfrm);
+    int bk  = digitalRead(bttnbck);
+
+    if (pressed(lft, bttnupP, tUp)) {
+      gBtn--; if (gBtn < 0) gBtn = 0;
+      drawActionButtons();
+    }
+    if (pressed(rgt, bttndwnP, tDwn)) {
+      gBtn++; if (gBtn > 2) gBtn = 2;
+      drawActionButtons();
+    }
+    if (pressed(ok, bttncnfrmP, tCnf)) {
+      if (gBtn == 0) { gameAction(gameId, "abort");  }
+      if (gBtn == 1) { gameAction(gameId, "resign"); }
+      if (gBtn == 2) { gameAction(gameId, "draw/yes"); }
+    }
+    if (pressed(bk, bttnbckP, tBck)) {
+      // leave the game screen (does not resign; game continues on lichess)
+      break;
+    }
+
+    delay(10);
+  }
+
+  client.stop();
+}
+
+// ====================================================================
 //                       LEAF ACTIONS & NAV
 // ====================================================================
 
@@ -734,10 +1220,9 @@ void runLeafAction(Screen from, int item) {
                  ST77XX_YELLOW);
           String id = startAIGame();
           if (id.length()) {
-            screen("Game on!", "vs Stockfish " + String(selLevel) +
-                   "\nID: " + id + "\n\nOpen lichess.org\nto see the board.", ST77XX_GREEN);
-            Serial.println("Game URL: https://lichess.org/" + id);
-            delay(2500);
+            // straight into the game screen with the returned id
+            playGame(id, "Stockfish " + String(selLevel),
+                     TIME_PRESETS[selTimeIdx].label);
           } else {
             screen("Start failed", "Lichess refused.\nSee serial log for\nthe response.", ST77XX_RED);
             delay(2000);
@@ -745,11 +1230,10 @@ void runLeafAction(Screen from, int item) {
         }
       }
       goToScreen(SCR_ONLINE);
-    } else if (item == 2) {
-      Serial.println("[action] Online: Play Player");
-    } else if (item == 3) {
-      Serial.println("[action] Online: Play Ranked");
     }
+  } else if (from == SCR_PVP_CAT) {
+    runFindGame(item - 1);
+    goToScreen(SCR_PVP_CAT);
   } else if (from == SCR_FAME) {
     Serial.println("[action] Famous game viewer");
   } else if (from == SCR_LPVP) {
