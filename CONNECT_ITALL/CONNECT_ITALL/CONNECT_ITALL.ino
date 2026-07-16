@@ -16,7 +16,6 @@
 #define TFT_RST   4
 #define TFT_BLK  32
 
-// warm amber for edit highlight (RGB565), in case ST77XX_ORANGE is undefined
 #define CL_AMBER 0xFD20
 #define CL_GREY  0x8410
 #define CL_DGREEN 0x03E0
@@ -34,15 +33,15 @@ bool portalShouldClose = false;
 String ssid;
 String password;
 String token;
-String username = "";          // filled after account check
+String username = "";
 
-const int STATUS_H = 18;       // height of the top status bar
+const int STATUS_H = 18;
 
 // ---------- buttons ----------
-const int bttnup    = 36;   // S_VP  (input-only, external pull-up)
-const int bttndwn   = 39;   // S_VN  (input-only, external pull-up)
-const int bttncnfrm = 34;   // input-only, external pull-up
-const int bttnbck   = 35;   // input-only, external pull-up
+const int bttnup    = 36;
+const int bttndwn   = 39;
+const int bttncnfrm = 34;
+const int bttnbck   = 35;
 
 int bttnupS = HIGH, bttndwnS = HIGH, bttncnfrmS = HIGH, bttnbckS = HIGH;
 int bttnupP = HIGH, bttndwnP = HIGH, bttncnfrmP = HIGH, bttnbckP = HIGH;
@@ -54,10 +53,10 @@ enum Screen {
   SCR_MENU, SCR_LOCAL, SCR_ONLINE, SCR_FAME, SCR_LPVP,
   SCR_Bot, SCR_Player, SCR_Ranked, SCR_SETTINGS, SCR_DELETE
 };
-const Screen SAME = (Screen)-1;   // sentinel: "no transition / leaf action"
+const Screen SAME = (Screen)-1;
 
 Screen current = SCR_MENU;
-int selection = 1;                // 1-based index of highlighted item
+int selection = 1;
 
 struct ScreenDef {
   const char* title;
@@ -435,11 +434,10 @@ void runPortal() {
 //                    STOCKFISH SETTINGS SCREEN
 // ====================================================================
 
-// ---- game settings the user configures ----
-int    selLevel    = 3;         // Stockfish 1-8
-int    selTimeIdx  = 2;         // index into TIME_PRESETS
-int    selColorIdx = 0;         // 0=white 1=black 2=random
-String selColor    = "white";   // finalized on Play Now
+int    selLevel    = 3;
+int    selTimeIdx  = 2;
+int    selColorIdx = 0;
+String selColor    = "white";
 
 struct TimePreset { int limit; int inc; const char* label; };
 const TimePreset TIME_PRESETS[] = {
@@ -462,59 +460,68 @@ int  setCursor = 0;
 bool editing   = false;
 int  editBackup = 0;
 
-void drawSettings() {
-  tft.fillScreen(ST77XX_BLACK);
-  drawStatusBar();
+// --- layout constants shared by full + partial draws (single source) ---
+const int SET_TOP   = STATUS_H + 44;   // first row y
+const int SET_ROWH  = 34;
+const int VAL_X     = 105;             // value column x
+const int VAL_W     = 62;              // width of value cell to clear
+int rowY(int r) { return SET_TOP + r * SET_ROWH; }
 
-  // Header
-  tft.fillRect(0, STATUS_H, tft.width(), 34, ST77XX_BLUE);
+String rowValue(int r) {
+  if (r == ROW_LEVEL) return String(selLevel);
+  if (r == ROW_TIME)  return TIME_PRESETS[selTimeIdx].label;
+  return COLOR_LABELS[selColorIdx];
+}
+
+// Draw ONE row's value cell (clears just that cell first). Single source
+// of truth for value rendering — used by both full and partial draws.
+void drawValue(int r) {
+  int y = rowY(r);
+  bool active = (setCursor == r);
+  bool isEditingThis = (active && editing);
+
+  tft.fillRect(VAL_X, y, VAL_W, 16, ST77XX_BLACK);   // erase just this cell
+
+  String v = rowValue(r);
   tft.setTextSize(2);
-  tft.setCursor(6, STATUS_H + 9);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.print("Stockfish");
-
-  int top = STATUS_H + 44;
-  int rowH = 34;
-
-  const char* labels[3] = { "Level", "Time", "Color" };
-  String values[3];
-  values[0] = String(selLevel);
-  values[1] = TIME_PRESETS[selTimeIdx].label;
-  values[2] = COLOR_LABELS[selColorIdx];
-
-  for (int r = 0; r < 3; r++) {
-    int y = top + r * rowH;
-    bool active = (setCursor == r);
-    bool isEditingThis = (active && editing);
-
-    // '>' cursor
-    tft.setTextSize(2);
-    tft.setCursor(2, y);
-    tft.setTextColor(active ? ST77XX_YELLOW : ST77XX_BLACK);
-    tft.print(active ? ">" : " ");
-
-    // label
-    tft.setCursor(18, y);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.print(labels[r]);
-
-    // value (faux-bold + amber while editing)
-    int vx = 105;
-    if (isEditingThis) {
-      tft.setTextColor(CL_AMBER);
-      tft.setCursor(vx + 1, y);
-      tft.print(values[r]);           // 2nd pass -> bold
-      tft.setCursor(vx, y);
-    } else {
-      tft.setTextColor(active ? ST77XX_YELLOW : ST77XX_CYAN);
-      tft.setCursor(vx, y);
-    }
-    tft.print(values[r]);
+  if (isEditingThis) {
+    tft.setTextColor(CL_AMBER);
+    tft.setCursor(VAL_X + 1, y);
+    tft.print(v);                 // faux-bold 2nd pass
+  } else {
+    tft.setTextColor(active ? ST77XX_YELLOW : ST77XX_CYAN);
   }
+  tft.setCursor(VAL_X, y);
+  tft.print(v);
+}
 
-  // Start bar
+// Draw one row's cursor + label (the static-ish left side of the row).
+void drawRowLabel(int r) {
+  int y = rowY(r);
+  bool active = (setCursor == r);
+  const char* labels[3] = { "Level", "Time", "Color" };
+
+  // cursor cell
+  tft.fillRect(2, y, 14, 16, ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(2, y);
+  tft.setTextColor(active ? ST77XX_YELLOW : ST77XX_BLACK);
+  tft.print(active ? ">" : " ");
+
+  // label
+  tft.setCursor(18, y);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(labels[r]);
+}
+
+// Draw the Start bar (its own cell at the bottom).
+void drawStartBar() {
   int by = tft.height() - 40;
   bool startActive = (setCursor == ROW_START);
+
+  // clear a little margin so the highlight outline doesn't leave ghosts
+  tft.fillRect(4, by - 4, tft.width() - 8, 40, ST77XX_BLACK);
+
   uint16_t barCol = startActive ? ST77XX_GREEN : CL_DGREEN;
   tft.fillRoundRect(10, by, tft.width() - 20, 30, 6, barCol);
   if (startActive) tft.drawRoundRect(8, by - 2, tft.width() - 16, 34, 7, ST77XX_YELLOW);
@@ -522,13 +529,35 @@ void drawSettings() {
   tft.setTextColor(ST77XX_BLACK);
   tft.setCursor(tft.width()/2 - 48, by + 8);
   tft.print("PLAY NOW");
+}
 
-  // hint
+// Draw the bottom hint line (changes with mode).
+void drawHint() {
+  tft.fillRect(0, tft.height() - 10, tft.width(), 10, ST77XX_BLACK);
   tft.setTextSize(1);
   tft.setTextColor(CL_GREY);
   tft.setCursor(6, tft.height() - 8);
   tft.print(editing ? "up/dn adjust  sel ok  back cancel"
                     : "up/dn move  sel choose  back exit");
+}
+
+// Full redraw — used on entry, cursor moves, and mode changes.
+void drawSettings() {
+  tft.fillScreen(ST77XX_BLACK);
+  drawStatusBar();
+
+  tft.fillRect(0, STATUS_H, tft.width(), 34, ST77XX_BLUE);
+  tft.setTextSize(2);
+  tft.setCursor(6, STATUS_H + 9);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("Stockfish");
+
+  for (int r = 0; r < 3; r++) {
+    drawRowLabel(r);
+    drawValue(r);
+  }
+  drawStartBar();
+  drawHint();
 }
 
 void editAdjust(int delta) {
@@ -562,8 +591,9 @@ void restoreRow() {
   switch (setCursor) {
     case ROW_LEVEL: selLevel    = editBackup; break;
     case ROW_TIME:  selTimeIdx  = editBackup; break;
-    case ROW_COLOR: selColorIdx = editBackup; break;
+    case ROW_COLOR: editBackup = editBackup;  break;  // no-op guard
   }
+  if (setCursor == ROW_COLOR) selColorIdx = editBackup;
 }
 
 // Returns true if user chose PLAY NOW, false if they backed out.
@@ -579,34 +609,57 @@ bool runStockfishSettings() {
     int bk = digitalRead(bttnbck);
 
     if (pressed(up, bttnupP, tUp)) {
-      if (editing) editAdjust(+1);
-      else { setCursor--; if (setCursor < 0) setCursor = 0; }
-      drawSettings();
+      if (editing) {
+        editAdjust(+1);
+        drawValue(setCursor);        // <-- partial: only the value cell
+      } else {
+        int prev = setCursor;
+        setCursor--; if (setCursor < 0) setCursor = 0;
+        if (setCursor != prev) {
+          // repaint only the two affected rows' cursor cells + start bar
+          drawRowLabel(prev); if (prev < 3) drawValue(prev);
+          if (setCursor < 3) { drawRowLabel(setCursor); drawValue(setCursor); }
+          drawStartBar();
+        }
+      }
     }
     if (pressed(dn, bttndwnP, tDwn)) {
-      if (editing) editAdjust(-1);
-      else { setCursor++; if (setCursor > NUM_ROWS - 1) setCursor = NUM_ROWS - 1; }
-      drawSettings();
+      if (editing) {
+        editAdjust(-1);
+        drawValue(setCursor);        // <-- partial
+      } else {
+        int prev = setCursor;
+        setCursor++; if (setCursor > NUM_ROWS - 1) setCursor = NUM_ROWS - 1;
+        if (setCursor != prev) {
+          drawRowLabel(prev); if (prev < 3) drawValue(prev);
+          if (setCursor < 3) { drawRowLabel(setCursor); drawValue(setCursor); }
+          drawStartBar();
+        }
+      }
     }
     if (pressed(ok, bttncnfrmP, tCnf)) {
       if (setCursor == ROW_START) {
         selColor = COLOR_VALUES[selColorIdx];
         return true;
       } else if (editing) {
-        editing = false;              // confirm value
+        editing = false;
+        drawValue(setCursor);        // value returns to normal color
+        drawHint();
       } else {
         snapshotRow();
-        editing = true;               // enter edit mode
+        editing = true;
+        drawValue(setCursor);        // value turns amber/bold
+        drawHint();
       }
-      drawSettings();
     }
     if (pressed(bk, bttnbckP, tBck)) {
       if (editing) {
-        restoreRow();                 // discard change
+        restoreRow();
         editing = false;
-        drawSettings();
+        drawValue(setCursor);        // revert + normal color
+        drawHint();
       } else {
-        return false;                 // leave screen
+        return false;
       }
     }
     delay(5);
@@ -614,8 +667,6 @@ bool runStockfishSettings() {
 }
 
 // ---------- start a game vs Stockfish AI ----------
-// Uses selLevel, selColor, and the chosen time preset.
-// Returns the new game id, or "" on failure.
 String startAIGame() {
   if (WiFi.status() != WL_CONNECTED) return "";
 
@@ -660,7 +711,7 @@ String startAIGame() {
 void runLeafAction(Screen from, int item) {
   if (from == SCR_SETTINGS) {
     switch (item) {
-      case 1: runPortal();   break;   // "Network"
+      case 1: runPortal();   break;
     }
   } else if (from == SCR_DELETE) {
     if (item == 1) {
@@ -674,16 +725,24 @@ void runLeafAction(Screen from, int item) {
     if (item == 1) {                          // "Play Stockfish"
       bool go = runStockfishSettings();
       if (go) {
-        screen("Starting", "Lvl " + String(selLevel) +
-               "   " + TIME_PRESETS[selTimeIdx].label +
-               "\n" + selColor, ST77XX_GREEN);
-        // TODO: uncomment to actually create the game:
-        // String id = startAIGame();
-        // if (id.length())
-        //   screen("Game started", "ID: " + id + "\nCheck lichess.org", ST77XX_GREEN);
-        // else
-        //   screen("Failed", "Could not start.\nSee serial log.", ST77XX_RED);
-        delay(1400);
+        if (WiFi.status() != WL_CONNECTED) {
+          screen("No WiFi", "Connect first via\nSettings > Network.", ST77XX_RED);
+          delay(1400);
+        } else {
+          screen("Starting", "Lvl " + String(selLevel) + "  " +
+                 TIME_PRESETS[selTimeIdx].label + "\n" + selColor + "\n\nContacting Lichess...",
+                 ST77XX_YELLOW);
+          String id = startAIGame();
+          if (id.length()) {
+            screen("Game on!", "vs Stockfish " + String(selLevel) +
+                   "\nID: " + id + "\n\nOpen lichess.org\nto see the board.", ST77XX_GREEN);
+            Serial.println("Game URL: https://lichess.org/" + id);
+            delay(2500);
+          } else {
+            screen("Start failed", "Lichess refused.\nSee serial log for\nthe response.", ST77XX_RED);
+            delay(2000);
+          }
+        }
       }
       goToScreen(SCR_ONLINE);
     } else if (item == 2) {
