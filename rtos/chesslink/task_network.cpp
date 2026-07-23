@@ -3,14 +3,14 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-// config (move to NVS in production)
+// - config (move to NVS in production) -
 
 #define WIFI_SSID      "YOUR_SSID"
 #define WIFI_PASS      "YOUR_PASS"
 #define LICHESS_TOKEN  "YOUR_LICHESS_API_TOKEN"
 #define LICHESS_BASE   "https://lichess.org"
 
-// internal state
+// - internal state -
 
 typedef enum {
     NET_STATE_DISCONNECTED,
@@ -21,7 +21,7 @@ typedef enum {
 static NetState_t net_state   = NET_STATE_DISCONNECTED;
 static char       game_id[16] = {};
 
-// WiFi
+// - WiFi -
 
 static bool wifi_connect(void) {
     Serial.printf("[net] connecting to %s...\n", WIFI_SSID);
@@ -40,7 +40,7 @@ static bool wifi_connect(void) {
     return false;
 }
 
-// lichess API helpers
+// - lichess API helpers -
 
 // POST /api/board/game/{gameId}/move/{uci}
 static bool lichess_post_move(const char *game, const char *uci) {
@@ -155,7 +155,7 @@ static void lichess_stream_game(const char *game) {
     http.end();
 }
 
-// task
+// - task -
 
 void task_Network(void *pvParameters) {
     MoveEvent_t player_mv;

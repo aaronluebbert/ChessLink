@@ -1,7 +1,7 @@
 #include "chesslink.h"
 #include <FastLED.h>
 
-// LED buffer
+// - LED buffer -
 
 static CRGB leds[NUM_SQUARES];
 
@@ -10,7 +10,7 @@ static inline uint8_t sq_to_led(uint8_t sq) {
     return sq;
 }
 
-// command handlers
+// - command handlers -
 
 static void apply_led_cmd(const LedCmd_t *cmd) {
     switch (cmd->type) {
@@ -46,7 +46,7 @@ static void apply_led_cmd(const LedCmd_t *cmd) {
     }
 }
 
-// task
+// - task -
 
 void task_LedControl(void *pvParameters) {
     FastLED.addLeds<WS2812B, LED_DATA_PIN, GRB>(leds, NUM_SQUARES);
