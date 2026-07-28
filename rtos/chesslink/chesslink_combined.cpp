@@ -1,7 +1,6 @@
 // ChessLink RTOS -- combined source
-// generated from individual task files
 //
-// files included in order:
+// files:
 //   chesslink.h        -- shared types, pin defs, queue handles, task declarations
 //   chess_engine.h     -- bitboard types, move encoding, position struct, engine API
 //   chess_engine.cpp   -- attack tables, FEN parser, move gen, make/unmake, UCI helpers
@@ -10,10 +9,9 @@
 //   task_led.cpp       -- WS2812B via FastLED, LedCmd queue consumer
 //   task_buttons.cpp   -- debounced button polling, ButtonEvent queue
 //   task_game.cpp      -- game logic, move detection, promo picker state machine
-//   task_display.cpp   -- ST7789 rendering, game screen, promotion picker screen
-//   task_network.cpp   -- WiFi, lichess HTTP/stream, move posting
+//   task_display.cpp   -- ST7789 rendering, FEN-based board, promotion picker
+//   task_network.cpp   -- WiFi/NVS, lichess seek+stream, game ID extraction, clock
 //
-// to flash: rename to chesslink.ino (or keep as .cpp alongside a thin .ino stub)
 // partition scheme: No OTA (2MB APP / 2MB SPIFFS)
 
 // =============================================================================
@@ -31,8 +29,8 @@
 // --- pin definitions ---------------------------------------------------------
 
 // SN74HC165 shift registers (VSPI)
-#define SR_SCLK       18   // VSPI CLK
-#define SR_MISO       19   // VSPI MISO (QH from rank 1 SR)
+#define SR_SCLK       18
+#define SR_MISO       19   // QH from rank 1 SR
 #define SR_LOAD       5    // active-low parallel load, bit-banged
 
 // WS2812B via 74AHCT125 level shifter
@@ -46,7 +44,7 @@
 #define LCD_RST       -1
 #define LCD_BL        32
 
-// tactile buttons (input-only pins, no pullup available -- use external)
+// tactile buttons (input-only pins, no internal pullup -- needs external 10k to 3.3V)
 #define BTN_CYCLE     34   // cycle through promotion choices
 #define BTN_CONFIRM   35   // confirm selection
 
@@ -57,7 +55,6 @@
 
 // --- RTOS task config --------------------------------------------------------
 
-// stack sizes in words
 #define STACK_SENSOR    4096
 #define STACK_LED       4096
 #define STACK_GAME      6144
@@ -65,23 +62,16 @@
 #define STACK_NETWORK   8192
 #define STACK_BUTTONS   2048
 
-// priorities -- higher = more urgent
-#define PRI_SENSOR      5   // must hit 50 Hz, nothing preempts it
-#define PRI_LED         4   // RMT timing sensitive
-#define PRI_GAME        3   // pure compute, no I/O
-#define PRI_BUTTONS     3   // same as game -- button response needs to be snappy
-#define PRI_NETWORK     2   // above display so incoming moves aren't starved
-#define PRI_DISPLAY     1   // late redraw is fine, missed move is not
+// higher = more urgent
+#define PRI_SENSOR      5
+#define PRI_LED         4
+#define PRI_GAME        3
+#define PRI_BUTTONS     3
+#define PRI_NETWORK     2
+#define PRI_DISPLAY     1
 
-// core assignments
-//
-// core 1 -- sensor, LED, game logic, buttons
-//   all pure compute or dedicated peripherals (VSPI, RMT, GPIO)
-//   no WiFi stack interference
-//
-// core 0 -- network, display
-//   ESP32 WiFi/TCP stack is a system task on core 0
-//   network must live here, display stays here too (HSPI, infrequent redraws)
+// core 1: sensor, LED, game logic, buttons -- pure compute, no WiFi interference
+// core 0: network, display -- must share with ESP32 WiFi/TCP system tasks
 #define CORE_SENSOR     1
 #define CORE_LED        1
 #define CORE_GAME       1
@@ -97,26 +87,24 @@
 #define Q_BUTTON_DEPTH        8
 
 // timing
-#define SENSOR_SCAN_MS    20    // 50 Hz
-#define LED_UPDATE_MS     16    // ~60 fps
-#define BTN_POLL_MS       20    // 50 Hz button poll
-#define BTN_DEBOUNCE_MS   50    // ms of stable state before registering press
-#define DEBOUNCE_SCANS    3     // sensor debounce: consecutive identical reads
+#define SENSOR_SCAN_MS    20
+#define LED_UPDATE_MS     16
+#define BTN_POLL_MS       20
+#define BTN_DEBOUNCE_MS   50
+#define DEBOUNCE_SCANS    3
 
 // --- data types --------------------------------------------------------------
 
-// raw 64-bit occupancy bitmask (bit N = square N occupied)
 typedef struct {
     uint64_t occupied;
     uint32_t timestamp_ms;
 } BoardState_t;
 
-// LED command: game logic -> LED control
 typedef enum {
     LED_CMD_SET_SQUARE,
     LED_CMD_SET_ALL,
     LED_CMD_CLEAR,
-    LED_CMD_PATTERN,   // mask squares lit with color, rest dimmed
+    LED_CMD_PATTERN,
 } LedCmdType_t;
 
 typedef struct {
@@ -126,41 +114,41 @@ typedef struct {
     uint64_t mask;
 } LedCmd_t;
 
-// button events: button task -> game logic
 typedef enum {
-    BTN_EVT_CYCLE,    // BTN_CYCLE pressed
-    BTN_EVT_CONFIRM,  // BTN_CONFIRM pressed
+    BTN_EVT_CYCLE,
+    BTN_EVT_CONFIRM,
 } ButtonEvent_t;
 
-// promotion picker state -- embedded in GameState_t so display knows what to show
 typedef enum {
-    PROMO_NONE,       // not in a promotion
-    PROMO_SELECTING,  // player is choosing a piece
+    PROMO_NONE,
+    PROMO_SELECTING,
 } PromoState_t;
 
-// game state snapshot: game logic -> LCD display
 typedef enum {
     GAME_MODE_IDLE,
     GAME_MODE_LOCAL,
     GAME_MODE_LICHESS,
-    GAME_MODE_ANALYSIS,
 } GameMode_t;
 
 typedef struct {
     GameMode_t  mode;
     char        fen[92];
-    uint64_t    occupied;
-    uint8_t     active_color;   // 0=white, 1=black
-    int16_t     eval_cp;        // centipawn eval, INT16_MIN if unknown
+    uint8_t     active_color;     // 0=white, 1=black
+    int16_t     eval_cp;          // centipawn eval, INT16_MIN if unknown
     char        last_move[6];
     char        status_msg[32];
 
-    // promotion picker -- display shows picker when promo_state == PROMO_SELECTING
+    // clock data from lichess (ms remaining for each side, 0 if not in a timed game)
+    uint32_t    white_clock_ms;
+    uint32_t    black_clock_ms;
+    uint32_t    white_inc_ms;
+    uint32_t    black_inc_ms;
+
+    // promotion picker
     PromoState_t promo_state;
-    uint8_t      promo_cursor;  // 0=queen 1=rook 2=bishop 3=knight
+    uint8_t      promo_cursor;    // 0=queen 1=rook 2=bishop 3=knight
 } GameState_t;
 
-// move events between tasks
 typedef enum {
     MOVE_SRC_PLAYER,
     MOVE_SRC_OPPONENT,
@@ -171,9 +159,14 @@ typedef struct {
     uint8_t   from_sq;
     uint8_t   to_sq;
     char      uci[6];
+    // clock data piggy-backed on opponent move events (0 if not a timed game)
+    uint32_t  white_clock_ms;
+    uint32_t  black_clock_ms;
+    uint32_t  white_inc_ms;
+    uint32_t  black_inc_ms;
 } MoveEvent_t;
 
-// --- queue handles (defined in main.cpp) -------------------------------------
+// --- queue handles -----------------------------------------------------------
 
 extern QueueHandle_t xQ_BoardState;
 extern QueueHandle_t xQ_LedCmd;
@@ -192,7 +185,7 @@ void task_Network     (void *pvParameters);
 void task_Buttons     (void *pvParameters);
 
 // --- chess engine ------------------------------------------------------------
-// call once from setup() before any tasks start
+
 void chess_engine_init();
 
 
@@ -1348,6 +1341,12 @@ typedef struct {
     char        last_move[6];
     int16_t     eval_cp;
 
+    // clock data (from lichess, 0 if local game)
+    uint32_t    white_clock_ms;
+    uint32_t    black_clock_ms;
+    uint32_t    white_inc_ms;
+    uint32_t    black_inc_ms;
+
     // move detection
     MovePhase_t phase;
     uint8_t     lifted_sq;
@@ -1392,6 +1391,10 @@ static void publish_game_state(const GameCtx_t *ctx) {
     pos_to_fen(&ctx->pos, gs.fen, sizeof(gs.fen));
     strncpy(gs.last_move,  ctx->last_move,  sizeof(gs.last_move)  - 1);
     strncpy(gs.status_msg, ctx->status_msg, sizeof(gs.status_msg) - 1);
+    gs.white_clock_ms = ctx->white_clock_ms;
+    gs.black_clock_ms = ctx->black_clock_ms;
+    gs.white_inc_ms   = ctx->white_inc_ms;
+    gs.black_inc_ms   = ctx->black_inc_ms;
     xQueueOverwrite(xQ_GameState, &gs);
 }
 
@@ -1555,6 +1558,14 @@ static void apply_opponent_move(GameCtx_t *ctx, const MoveEvent_t *mv) {
     Position undo;
     make_move_pos(&ctx->pos, m, &undo);
 
+    // store clock data for display task (your groupmate's UI can read from GameState_t)
+    if (mv->white_clock_ms || mv->black_clock_ms) {
+        ctx->white_clock_ms = mv->white_clock_ms;
+        ctx->black_clock_ms = mv->black_clock_ms;
+        ctx->white_inc_ms   = mv->white_inc_ms;
+        ctx->black_inc_ms   = mv->black_inc_ms;
+    }
+
     strncpy(ctx->last_move, mv->uci, sizeof(ctx->last_move) - 1);
     snprintf(ctx->status_msg, sizeof(ctx->status_msg),
              "opp: %s  your turn", mv->uci);
@@ -1601,7 +1612,7 @@ void task_GameLogic(void *pvParameters) {
 
 
 // =============================================================================
-// task_display.cpp   -- ST7789 rendering, game screen, promotion picker screen
+// task_display.cpp   -- ST7789 rendering, FEN-based board, promotion picker
 // =============================================================================
 
 #include "chesslink.h"
@@ -1614,7 +1625,6 @@ void task_GameLogic(void *pvParameters) {
 static SPIClass hspi(HSPI);
 static Adafruit_ST7789 tft = Adafruit_ST7789(&hspi, LCD_CS, LCD_DC, LCD_RST);
 
-// physical display: 170x320 (portrait)
 #define D_W  170
 #define D_H  320
 
@@ -1630,25 +1640,22 @@ static Adafruit_ST7789 tft = Adafruit_ST7789(&hspi, LCD_CS, LCD_DC, LCD_RST);
 #define C_BLUE        0x001F
 #define C_PURPLE      0x780F
 
-// theme
 #define C_BG          C_BLACK
 #define C_HEADER_BG   0x0390
 #define C_TEXT        C_WHITE
 #define C_ACCENT      C_YELLOW
 #define C_DIM         C_DARK_GRAY
-
-// board square colors
 #define C_SQ_LIGHT    0xF7BE
 #define C_SQ_DARK     0x9A40
 
-// --- layout (170x320 portrait) -----------------------------------------------
+// --- layout ------------------------------------------------------------------
 //
-//  y=0    header bar (28px)
+//  y=0    header (28px)
 //  y=28   turn indicator (20px)
 //  y=48   last move (18px)
-//  y=66   status msg (18px)
-//  y=84   mini board (160x160, 20px/sq, x=5)
-//  y=244  padding (16px)
+//  y=66   status (18px)
+//  y=84   board (160x160, 20px/sq, x=5)
+//  y=244  padding
 //  y=260  eval bar (20px)
 //  y=280  padding to 320
 
@@ -1661,13 +1668,79 @@ static Adafruit_ST7789 tft = Adafruit_ST7789(&hspi, LCD_CS, LCD_DC, LCD_RST);
 #define STATUS_Y    66
 #define STATUS_H    18
 #define BOARD_SQ    20
-#define BOARD_PX    (BOARD_SQ * 8)   // 160
-#define BOARD_X     ((D_W - BOARD_PX) / 2)   // 5
+#define BOARD_PX    (BOARD_SQ * 8)
+#define BOARD_X     ((D_W - BOARD_PX) / 2)
 #define BOARD_Y     84
 #define EVAL_Y      260
 #define EVAL_H      20
 
-// --- normal game screen draw functions ---------------------------------------
+// --- FEN board parser --------------------------------------------------------
+//
+// parses the piece-placement section of a FEN string into a 64-byte array
+// where each entry is a piece char ('P','n','K', etc.) or 0 for empty.
+// used by draw_mini_board to render the right piece on each square.
+
+static void fen_to_squares(const char *fen, char *squares) {
+    memset(squares, 0, 64);
+    int rank = 7, file = 0;
+    for (const char *p = fen; *p && *p != ' '; p++) {
+        char c = *p;
+        if (c == '/') { rank--; file = 0; }
+        else if (c >= '1' && c <= '8') { file += c - '0'; }
+        else {
+            if (file < 8 && rank >= 0)
+                squares[rank * 8 + file] = c;
+            file++;
+        }
+    }
+}
+
+// --- board drawing -----------------------------------------------------------
+
+// draw one square at pixel coords (px, py) with the given piece char (0 = empty)
+// white pieces = uppercase, black pieces = lowercase
+static void draw_board_square(int px, int py, bool light_sq, char piece) {
+    uint16_t sq_color = light_sq ? C_SQ_LIGHT : C_SQ_DARK;
+    tft.fillRect(px, py, BOARD_SQ, BOARD_SQ, sq_color);
+
+    if (!piece) return;
+
+    bool is_white = (piece >= 'A' && piece <= 'Z');
+    char upper    = (piece >= 'a') ? piece - 32 : piece;
+
+    // draw piece circle -- white pieces: white fill, dark outline
+    //                       black pieces: dark fill, white outline
+    uint16_t fill    = is_white ? C_WHITE     : 0x2945;
+    uint16_t outline = is_white ? C_DARK_GRAY : C_WHITE;
+    int cx = px + BOARD_SQ / 2;
+    int cy = py + BOARD_SQ / 2;
+    tft.fillCircle(cx, cy, BOARD_SQ / 2 - 2, fill);
+    tft.drawCircle(cx, cy, BOARD_SQ / 2 - 2, outline);
+
+    // letter inside circle -- identifies piece type
+    // setTextSize(1) gives 6x8px characters, center them in the circle
+    tft.setTextSize(1);
+    tft.setTextColor(is_white ? C_BLACK : C_WHITE);
+    tft.setCursor(cx - 3, cy - 4);
+    tft.print(upper);
+}
+
+static void draw_mini_board(const char *fen) {
+    char squares[64];
+    fen_to_squares(fen, squares);
+
+    for (int row = 0; row < 8; row++) {
+        for (int col = 0; col < 8; col++) {
+            int px = BOARD_X + col * BOARD_SQ;
+            int py = BOARD_Y + (7 - row) * BOARD_SQ;  // rank 1 at bottom
+            draw_board_square(px, py, (row + col) % 2 == 0,
+                              squares[row * 8 + col]);
+        }
+    }
+    tft.drawRect(BOARD_X - 1, BOARD_Y - 1, BOARD_PX + 2, BOARD_PX + 2, C_LIGHT_GRAY);
+}
+
+// --- game screen draw functions ----------------------------------------------
 
 static void draw_header(GameMode_t mode) {
     tft.fillRect(0, HEADER_Y, D_W, HEADER_H, C_HEADER_BG);
@@ -1679,10 +1752,9 @@ static void draw_header(GameMode_t mode) {
     const char *label;
     uint16_t    color;
     switch (mode) {
-        case GAME_MODE_LOCAL:    label = "LOCAL";    color = C_BLUE;      break;
-        case GAME_MODE_LICHESS:  label = "LICHESS";  color = C_GREEN;     break;
-        case GAME_MODE_ANALYSIS: label = "ANALYSIS"; color = C_YELLOW;    break;
-        default:                 label = "IDLE";     color = C_DARK_GRAY; break;
+        case GAME_MODE_LOCAL:   label = "LOCAL";   color = C_BLUE;      break;
+        case GAME_MODE_LICHESS: label = "LICHESS"; color = C_GREEN;     break;
+        default:                label = "IDLE";    color = C_DARK_GRAY; break;
     }
     tft.fillRect(D_W - 54, 7, 52, 14, color);
     tft.setTextColor(C_BLACK);
@@ -1747,50 +1819,26 @@ static void draw_eval_bar(int16_t eval_cp) {
     tft.print(buf);
 }
 
-static void draw_mini_board(uint64_t occupied) {
-    for (int row = 0; row < 8; row++) {
-        for (int col = 0; col < 8; col++) {
-            uint8_t sq  = (uint8_t)(row * 8 + col);
-            bool    lit = (row + col) % 2 == 0;
-            int x = BOARD_X + col * BOARD_SQ;
-            int y = BOARD_Y + (7 - row) * BOARD_SQ;  // rank 1 at bottom
-            tft.fillRect(x, y, BOARD_SQ, BOARD_SQ, lit ? C_SQ_LIGHT : C_SQ_DARK);
-            if (occupied & (1ULL << sq))
-                tft.fillCircle(x + BOARD_SQ / 2, y + BOARD_SQ / 2,
-                               BOARD_SQ / 2 - 2, C_WHITE);
-        }
-    }
-    tft.drawRect(BOARD_X - 1, BOARD_Y - 1, BOARD_PX + 2, BOARD_PX + 2, C_LIGHT_GRAY);
-}
-
 static void render_game_state(const GameState_t *gs) {
     tft.fillScreen(C_BG);
     draw_header(gs->mode);
     draw_turn_indicator(gs->active_color);
     draw_last_move(gs->last_move);
     draw_status(gs->status_msg);
-    draw_mini_board(gs->occupied);
+    draw_mini_board(gs->fen);
     draw_eval_bar(gs->eval_cp);
 }
 
 // --- promotion picker screen -------------------------------------------------
 //
-// replaces the normal game view while PROMO_SELECTING.
-// shows 4 piece options in a 2x2 grid with the cursor highlighted.
-// BTN_CYCLE cycles the highlight, BTN_CONFIRM commits.
+// 2x2 tile grid, cycle with BTN_CYCLE, confirm with BTN_CONFIRM
 //
-// layout (centered in 170x320):
-//
-//   y=0    header (28px, reused)
-//   y=40   "PROMOTE PAWN" title
-//   y=70   2x2 grid of piece tiles (each 70x80px)
-//            col0 x=5,  col1 x=90
-//            row0 y=70  (queen, rook)
-//            row1 y=160 (bishop, knight)
-//   y=260  hint text
-//   y=290  button legend
+//  y=0    header (reused)
+//  y=30   purple title bar
+//  y=62   row 0 tiles: queen (x=5), rook (x=93)
+//  y=150  row 1 tiles: bishop (x=5), knight (x=93)
+//  y=240  button legend
 
-// piece tile colors (RGB565)
 static const uint16_t PROMO_COLORS[4] = {
     0xC600,   // queen -- gold
     0x07FF,   // rook -- cyan
@@ -1817,15 +1865,13 @@ static void draw_promo_tile(int idx, bool selected) {
     tft.fillRect(x, y, TILE_W, TILE_H, bg);
     tft.drawRect(x, y, TILE_W, TILE_H, border);
     if (selected)
-        tft.drawRect(x + 1, y + 1, TILE_W - 2, TILE_H - 2, border);  // double border on selected
+        tft.drawRect(x + 1, y + 1, TILE_W - 2, TILE_H - 2, border);
 
-    // piece initial letter -- large, centered in tile
     tft.setTextColor(fg);
     tft.setTextSize(4);
     tft.setCursor(x + TILE_W / 2 - 12, y + 14);
     tft.print(PROMO_LABELS[idx][0]);
 
-    // piece name -- small, below letter
     tft.setTextSize(1);
     tft.setCursor(x + 4, y + TILE_H - 14);
     tft.print(PROMO_LABELS[idx]);
@@ -1833,22 +1879,17 @@ static void draw_promo_tile(int idx, bool selected) {
 
 static void render_promo_picker(const GameState_t *gs) {
     tft.fillScreen(C_BG);
-
-    // reuse header
     draw_header(gs->mode);
 
-    // title bar
     tft.fillRect(0, 30, D_W, 28, C_PURPLE);
     tft.setTextColor(C_WHITE);
     tft.setTextSize(1);
     tft.setCursor(28, 40);
     tft.print("PROMOTE PAWN -- choose piece");
 
-    // 2x2 tile grid
     for (int i = 0; i < 4; i++)
         draw_promo_tile(i, i == gs->promo_cursor);
 
-    // button legend at bottom
     tft.setTextColor(C_DIM);
     tft.setTextSize(1);
     tft.setCursor(4, 240);
@@ -1857,8 +1898,7 @@ static void render_promo_picker(const GameState_t *gs) {
     tft.print("[CONFIRM] lock in choice");
 }
 
-// partial redraw for picker -- only re-draws the tiles, not the full screen.
-// called when promo_cursor changes so we don't flicker the whole display.
+// only redraws the tiles when cursor moves -- avoids full-screen flicker
 static void redraw_promo_tiles(const GameState_t *gs) {
     for (int i = 0; i < 4; i++)
         draw_promo_tile(i, i == gs->promo_cursor);
@@ -1877,7 +1917,6 @@ void task_LcdDisplay(void *pvParameters) {
         digitalWrite(LCD_BL, HIGH);
     }
 
-    // splash
     tft.setTextColor(C_WHITE);
     tft.setTextSize(2);
     tft.setCursor(14, 140);
@@ -1888,24 +1927,20 @@ void task_LcdDisplay(void *pvParameters) {
     tft.print("initializing...");
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    GameState_t  gs       = {};
+    GameState_t  gs                = {};
     PromoState_t last_promo_state  = PROMO_NONE;
-    uint8_t      last_promo_cursor = 0xFF;  // force initial draw
+    uint8_t      last_promo_cursor = 0xFF;
 
     for (;;) {
         if (xQueueReceive(xQ_GameState, &gs, pdMS_TO_TICKS(250)) != pdTRUE)
             continue;
 
         if (gs.promo_state == PROMO_SELECTING) {
-            if (last_promo_state != PROMO_SELECTING) {
-                // just entered picker -- full redraw
+            if (last_promo_state != PROMO_SELECTING)
                 render_promo_picker(&gs);
-            } else if (gs.promo_cursor != last_promo_cursor) {
-                // cursor moved -- only redraw tiles to avoid flicker
+            else if (gs.promo_cursor != last_promo_cursor)
                 redraw_promo_tiles(&gs);
-            }
         } else {
-            // normal game screen
             render_game_state(&gs);
         }
 
@@ -1918,7 +1953,7 @@ void task_LcdDisplay(void *pvParameters) {
 
 
 // =============================================================================
-// task_network.cpp   -- WiFi, lichess HTTP/stream, move posting
+// task_network.cpp   -- WiFi/NVS, lichess seek+stream, game ID extraction, clock
 // =============================================================================
 
 #include "chesslink.h"
@@ -1926,14 +1961,19 @@ void task_LcdDisplay(void *pvParameters) {
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-// - config (move to NVS in production) -
+// --- config ------------------------------------------------------------------
+// WiFi credentials: loaded from NVS by groupmate's provisioning code.
+// these are fallback defines only -- if NVS has credentials, those win.
+// see task_NetSetup (groupmate's code) which writes "ssid"/"pass" to NVS
+// under namespace "wifi" before this task runs.
 
-#define WIFI_SSID      "YOUR_SSID"
-#define WIFI_PASS      "YOUR_PASS"
+#include <Preferences.h>
+static Preferences prefs;
+
 #define LICHESS_TOKEN  "YOUR_LICHESS_API_TOKEN"
 #define LICHESS_BASE   "https://lichess.org"
 
-// - internal state -
+// --- internal state ----------------------------------------------------------
 
 typedef enum {
     NET_STATE_DISCONNECTED,
@@ -1941,14 +1981,35 @@ typedef enum {
     NET_STATE_IN_GAME,
 } NetState_t;
 
-static NetState_t net_state   = NET_STATE_DISCONNECTED;
-static char       game_id[16] = {};
+static NetState_t net_state      = NET_STATE_DISCONNECTED;
+static char       game_id[24]    = {};   // lichess game IDs are 8 chars but give headroom
+static bool       we_are_white   = true; // set from gameFull, determines which moves are ours
 
-// - WiFi -
+// clock state
+static uint32_t s_white_clock_ms = 0;
+static uint32_t s_black_clock_ms = 0;
+static uint32_t s_white_inc_ms   = 0;
+static uint32_t s_black_inc_ms   = 0;
+
+// --- WiFi --------------------------------------------------------------------
+//
+// reads SSID/pass from NVS namespace "wifi", keys "ssid" and "pass".
+// this is the namespace groupmate's captive portal writes to.
+// if NVS is empty (first boot, or never provisioned) returns false.
 
 static bool wifi_connect(void) {
-    Serial.printf("[net] connecting to %s...\n", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    prefs.begin("wifi", true);  // read-only
+    String ssid = prefs.getString("ssid", "");
+    String pass = prefs.getString("pass", "");
+    prefs.end();
+
+    if (ssid.length() == 0) {
+        Serial.println("[net] no WiFi credentials in NVS -- run provisioning first");
+        return false;
+    }
+
+    Serial.printf("[net] connecting to %s...\n", ssid.c_str());
+    WiFi.begin(ssid.c_str(), pass.c_str());
 
     for (int elapsed = 0; elapsed < 15000 && WiFi.status() != WL_CONNECTED; elapsed += 500) {
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -1959,18 +2020,18 @@ static bool wifi_connect(void) {
         Serial.printf("\n[net] connected -- IP %s\n", WiFi.localIP().toString().c_str());
         return true;
     }
-    Serial.println("\n[net] WiFi failed");
+    Serial.println("\n[net] WiFi connect failed");
     return false;
 }
 
-// - lichess API helpers -
+// --- lichess helpers ---------------------------------------------------------
 
 // POST /api/board/game/{gameId}/move/{uci}
-static bool lichess_post_move(const char *game, const char *uci) {
+static bool lichess_post_move(const char *gid, const char *uci) {
     if (WiFi.status() != WL_CONNECTED) return false;
 
     char url[128];
-    snprintf(url, sizeof(url), "%s/api/board/game/%s/move/%s", LICHESS_BASE, game, uci);
+    snprintf(url, sizeof(url), "%s/api/board/game/%s/move/%s", LICHESS_BASE, gid, uci);
 
     HTTPClient http;
     http.begin(url);
@@ -1983,49 +2044,141 @@ static bool lichess_post_move(const char *game, const char *uci) {
     return code == 200;
 }
 
-// POST /api/board/seek -- 5+3 blitz, rated
-static bool lichess_seek_game(void) {
-    if (WiFi.status() != WL_CONNECTED) return false;
+// --- move color tracking -----------------------------------------------------
+//
+// lichess streams the full moves list on every gameState event.
+// we count how many moves have been played -- even count means white just moved,
+// odd means black just moved. combined with we_are_white we know if it's ours.
+//
+// we only forward moves to game logic when it's the OPPONENT who just moved.
+// this prevents the board from trying to re-apply our own move.
 
-    HTTPClient http;
-    http.begin(LICHESS_BASE "/api/board/seek");
-    http.addHeader("Authorization", "Bearer " LICHESS_TOKEN);
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-
-    int code = http.POST("rated=true&time=5&increment=3&variant=standard");
-    Serial.printf("[net] seek result: HTTP %d\n", code);
-    http.end();
-    return code == 200 || code == 201;
+static int count_moves(const char *moves_str) {
+    if (!moves_str || !strlen(moves_str)) return 0;
+    int count = 1;
+    for (const char *p = moves_str; *p; p++)
+        if (*p == ' ') count++;
+    return count;
 }
 
-// GET /api/board/game/stream/{gameId} -- NDJSON long-poll.
-// reads until connection drops or a player move arrives to post.
-// TODO: replace with proper streaming HTTP client for robustness
-static void lichess_stream_game(const char *game) {
+// --- stream line handler -----------------------------------------------------
+
+static void handle_stream_line(const char *line) {
+    StaticJsonDocument<1024> doc;
+    if (deserializeJson(doc, line)) {
+        Serial.println("[net] JSON parse error");
+        return;
+    }
+
+    const char *type = doc["type"];
+    if (!type) return;
+
+    if (strcmp(type, "gameFull") == 0) {
+        // gameFull arrives first on the stream -- extract game metadata
+        // figure out which color we are by matching token owner's username
+        // lichess puts our color under white.id or black.id
+        // TODO: when Lichess OAuth is integrated, compare against the authed username.
+        // for now we read "orientation" which lichess sets to our color.
+        const char *orientation = doc["orientation"];
+        if (orientation) {
+            we_are_white = (strcmp(orientation, "white") == 0);
+            Serial.printf("[net] we are %s\n", we_are_white ? "white" : "black");
+        }
+
+        // process the nested initial state
+        JsonObjectConst state = doc["state"].as<JsonObjectConst>();
+        if (state.isNull()) return;
+
+        // clock from initial state
+        if (state.containsKey("wtime")) s_white_clock_ms = state["wtime"].as<uint32_t>();
+        if (state.containsKey("btime")) s_black_clock_ms = state["btime"].as<uint32_t>();
+        if (state.containsKey("winc"))  s_white_inc_ms   = state["winc"].as<uint32_t>();
+        if (state.containsKey("binc"))  s_black_inc_ms   = state["binc"].as<uint32_t>();
+
+        // no moves to forward on gameFull -- game is just starting
+        return;
+    }
+
+    if (strcmp(type, "gameState") == 0) {
+        // clock update
+        if (doc.containsKey("wtime")) s_white_clock_ms = doc["wtime"].as<uint32_t>();
+        if (doc.containsKey("btime")) s_black_clock_ms = doc["btime"].as<uint32_t>();
+        if (doc.containsKey("winc"))  s_white_inc_ms   = doc["winc"].as<uint32_t>();
+        if (doc.containsKey("binc"))  s_black_inc_ms   = doc["binc"].as<uint32_t>();
+
+        Serial.printf("[net] clock -- w:%lums b:%lums\n", s_white_clock_ms, s_black_clock_ms);
+
+        const char *moves = doc["moves"];
+        if (!moves || !strlen(moves)) return;
+
+        int n = count_moves(moves);
+        // after n moves: if n is odd, white just moved; if even, black just moved
+        // (move 1 = white, move 2 = black, ...)
+        bool white_just_moved = (n % 2 == 1);
+        bool opponent_just_moved = (we_are_white) ? !white_just_moved : white_just_moved;
+
+        if (!opponent_just_moved) return;  // our own move echoed back, ignore it
+
+        // extract the last UCI token
+        const char *last = strrchr(moves, ' ');
+        const char *uci  = last ? last + 1 : moves;
+        if (strlen(uci) < 4) return;
+
+        MoveEvent_t opp = { .src = MOVE_SRC_OPPONENT };
+        strncpy(opp.uci, uci, sizeof(opp.uci) - 1);
+        opp.from_sq        = (uint8_t)((opp.uci[0] - 'a') + (opp.uci[1] - '1') * 8);
+        opp.to_sq          = (uint8_t)((opp.uci[2] - 'a') + (opp.uci[3] - '1') * 8);
+        opp.white_clock_ms = s_white_clock_ms;
+        opp.black_clock_ms = s_black_clock_ms;
+        opp.white_inc_ms   = s_white_inc_ms;
+        opp.black_inc_ms   = s_black_inc_ms;
+        xQueueSend(xQ_OpponentMove, &opp, 0);
+        return;
+    }
+
+    if (strcmp(type, "gameFinish") == 0) {
+        Serial.println("[net] game finished");
+        // game logic will notice the board is back at starting position or similar
+        // for now just log it -- could send a special event type later
+    }
+}
+
+// --- game stream -------------------------------------------------------------
+//
+// GET /api/board/game/stream/{gameId}
+// blocks until game ends or connection drops
+
+static void lichess_stream_game(const char *gid) {
     if (WiFi.status() != WL_CONNECTED) return;
 
     char url[128];
-    snprintf(url, sizeof(url), "%s/api/board/game/stream/%s", LICHESS_BASE, game);
+    snprintf(url, sizeof(url), "%s/api/board/game/stream/%s", LICHESS_BASE, gid);
 
     HTTPClient http;
     http.begin(url);
     http.addHeader("Authorization", "Bearer " LICHESS_TOKEN);
-    http.setTimeout(30000);
+    http.setTimeout(60000);  // lichess sends keep-alive newlines every ~10s
 
-    if (http.GET() != 200) { http.end(); return; }
+    if (http.GET() != 200) {
+        Serial.printf("[net] stream open failed\n");
+        http.end();
+        return;
+    }
 
     WiFiClient *stream = http.getStreamPtr();
-    char line_buf[256];
+    char line_buf[512];
     int  line_len = 0;
 
-    MoveEvent_t  player_mv;
-    TickType_t   last_data = xTaskGetTickCount();
-    const TickType_t STREAM_TIMEOUT = pdMS_TO_TICKS(30000);
+    MoveEvent_t      player_mv;
+    TickType_t       last_data    = xTaskGetTickCount();
+    const TickType_t STREAM_TIMEOUT = pdMS_TO_TICKS(60000);  // generous, lichess keep-alives every ~10s
+
+    Serial.printf("[net] streaming game %s\n", gid);
 
     while (WiFi.status() == WL_CONNECTED) {
-        // post player moves without breaking the read loop
+        // flush any player moves while reading
         if (xQueueReceive(xQ_PlayerMove, &player_mv, 0) == pdTRUE)
-            lichess_post_move(game, player_mv.uci);
+            lichess_post_move(gid, player_mv.uci);
 
         if (stream->available()) {
             char c = (char)stream->read();
@@ -2034,34 +2187,8 @@ static void lichess_stream_game(const char *game) {
             if (c == '\n') {
                 line_buf[line_len] = '\0';
                 line_len = 0;
-
-                if (strlen(line_buf) == 0) continue;  // keep-alive newline
-
-                StaticJsonDocument<512> doc;
-                if (deserializeJson(doc, line_buf)) continue;
-
-                const char *type = doc["type"];
-                if (!type) continue;
-
-                if (strcmp(type, "gameState") == 0) {
-                    const char *moves = doc["moves"];
-                    if (!moves || !strlen(moves)) continue;
-
-                    // last space-delimited token is the most recent move
-                    const char *last = strrchr(moves, ' ');
-                    const char *uci  = last ? last + 1 : moves;
-
-                    if (strlen(uci) < 4) continue;
-
-                    // TODO: track color assignment properly, this blindly forwards
-                    // every state update as an opponent move
-                    MoveEvent_t opp = { .src = MOVE_SRC_OPPONENT };
-                    strncpy(opp.uci, uci, sizeof(opp.uci) - 1);
-                    opp.from_sq = (uint8_t)((opp.uci[0] - 'a') + (opp.uci[1] - '1') * 8);
-                    opp.to_sq   = (uint8_t)((opp.uci[2] - 'a') + (opp.uci[3] - '1') * 8);
-                    xQueueSend(xQ_OpponentMove, &opp, 0);
-                }
-
+                if (strlen(line_buf) > 0)
+                    handle_stream_line(line_buf);
             } else if (line_len < (int)sizeof(line_buf) - 2) {
                 line_buf[line_len++] = c;
             }
@@ -2076,38 +2203,123 @@ static void lichess_stream_game(const char *game) {
     }
 
     http.end();
+    Serial.println("[net] stream closed");
 }
 
-// - task -
+// --- seek game ---------------------------------------------------------------
+//
+// POST /api/board/seek is itself a streaming endpoint on lichess.
+// it holds the connection open and returns a "gameStart" event when a match
+// is found, containing the game ID we need.
+// we stream it just like the game stream until we get that event.
+
+static bool lichess_seek_and_get_id(char *out_id, size_t id_len) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    HTTPClient http;
+    http.begin(LICHESS_BASE "/api/board/seek");
+    http.addHeader("Authorization", "Bearer " LICHESS_TOKEN);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    http.setTimeout(120000);  // seek can take a while depending on pool size
+
+    Serial.println("[net] posting seek...");
+
+    // POST returns a stream -- we read it for the gameStart event
+    int code = http.POST("rated=true&time=5&increment=3&variant=standard");
+    if (code != 200) {
+        Serial.printf("[net] seek failed: HTTP %d\n", code);
+        http.end();
+        return false;
+    }
+
+    WiFiClient *stream = http.getStreamPtr();
+    char line_buf[256];
+    int  line_len = 0;
+    bool found    = false;
+
+    TickType_t       start         = xTaskGetTickCount();
+    const TickType_t SEEK_TIMEOUT  = pdMS_TO_TICKS(120000);
+
+    while (WiFi.status() == WL_CONNECTED
+           && (xTaskGetTickCount() - start) < SEEK_TIMEOUT) {
+
+        if (stream->available()) {
+            char c = (char)stream->read();
+
+            if (c == '\n') {
+                line_buf[line_len] = '\0';
+                line_len = 0;
+
+                if (strlen(line_buf) == 0) continue;
+
+                StaticJsonDocument<256> doc;
+                if (deserializeJson(doc, line_buf)) continue;
+
+                const char *type = doc["type"];
+                if (!type) continue;
+
+                if (strcmp(type, "gameStart") == 0) {
+                    // gameStart event: {"type":"gameStart","game":{"id":"abc12345",...}}
+                    const char *gid = doc["game"]["id"];
+                    if (gid && strlen(gid) > 0) {
+                        strncpy(out_id, gid, id_len - 1);
+                        out_id[id_len - 1] = '\0';
+                        Serial.printf("[net] game found: %s\n", out_id);
+                        found = true;
+                        break;
+                    }
+                }
+
+            } else if (line_len < (int)sizeof(line_buf) - 2) {
+                line_buf[line_len++] = c;
+            }
+
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
+    http.end();
+    return found;
+}
+
+// --- task --------------------------------------------------------------------
 
 void task_Network(void *pvParameters) {
     MoveEvent_t player_mv;
 
+    // retry WiFi indefinitely -- provisioning must run first
     while (!wifi_connect())
-        vTaskDelay(pdMS_TO_TICKS(30000));
+        vTaskDelay(pdMS_TO_TICKS(10000));  // retry every 10s, not 30s, feels more responsive
+
     net_state = NET_STATE_IDLE;
 
     for (;;) {
+        // wait for a player move as the trigger to seek or post
         if (xQueueReceive(xQ_PlayerMove, &player_mv, pdMS_TO_TICKS(5000)) == pdTRUE) {
+
             if (net_state == NET_STATE_IN_GAME) {
                 lichess_post_move(game_id, player_mv.uci);
 
             } else if (net_state == NET_STATE_IDLE) {
-                Serial.println("[net] seeking lichess game...");
-                if (lichess_seek_game()) {
-                    // TODO: extract real game_id from seek response
-                    strncpy(game_id, "stubgameid1", sizeof(game_id) - 1);
+                // seek a game and get the real ID before streaming
+                memset(game_id, 0, sizeof(game_id));
+                if (lichess_seek_and_get_id(game_id, sizeof(game_id))) {
                     net_state = NET_STATE_IN_GAME;
                     lichess_stream_game(game_id);
                     net_state = NET_STATE_IDLE;
+                    memset(game_id, 0, sizeof(game_id));
+                } else {
+                    Serial.println("[net] seek timed out or failed");
                 }
             }
         }
 
         if (WiFi.status() != WL_CONNECTED) {
             net_state = NET_STATE_DISCONNECTED;
-            Serial.println("[net] dropped, reconnecting...");
-            wifi_connect();
+            Serial.println("[net] connection dropped, reconnecting...");
+            while (!wifi_connect())
+                vTaskDelay(pdMS_TO_TICKS(10000));
             net_state = NET_STATE_IDLE;
         }
     }

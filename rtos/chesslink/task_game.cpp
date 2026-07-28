@@ -20,6 +20,12 @@ typedef struct {
     char        last_move[6];
     int16_t     eval_cp;
 
+    // clock data (from lichess, 0 if local game)
+    uint32_t    white_clock_ms;
+    uint32_t    black_clock_ms;
+    uint32_t    white_inc_ms;
+    uint32_t    black_inc_ms;
+
     // move detection
     MovePhase_t phase;
     uint8_t     lifted_sq;
@@ -64,6 +70,10 @@ static void publish_game_state(const GameCtx_t *ctx) {
     pos_to_fen(&ctx->pos, gs.fen, sizeof(gs.fen));
     strncpy(gs.last_move,  ctx->last_move,  sizeof(gs.last_move)  - 1);
     strncpy(gs.status_msg, ctx->status_msg, sizeof(gs.status_msg) - 1);
+    gs.white_clock_ms = ctx->white_clock_ms;
+    gs.black_clock_ms = ctx->black_clock_ms;
+    gs.white_inc_ms   = ctx->white_inc_ms;
+    gs.black_inc_ms   = ctx->black_inc_ms;
     xQueueOverwrite(xQ_GameState, &gs);
 }
 
@@ -226,6 +236,14 @@ static void apply_opponent_move(GameCtx_t *ctx, const MoveEvent_t *mv) {
 
     Position undo;
     make_move_pos(&ctx->pos, m, &undo);
+
+    // store clock data for display task (your groupmate's UI can read from GameState_t)
+    if (mv->white_clock_ms || mv->black_clock_ms) {
+        ctx->white_clock_ms = mv->white_clock_ms;
+        ctx->black_clock_ms = mv->black_clock_ms;
+        ctx->white_inc_ms   = mv->white_inc_ms;
+        ctx->black_inc_ms   = mv->black_inc_ms;
+    }
 
     strncpy(ctx->last_move, mv->uci, sizeof(ctx->last_move) - 1);
     snprintf(ctx->status_msg, sizeof(ctx->status_msg),

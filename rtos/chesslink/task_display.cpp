@@ -8,7 +8,6 @@
 static SPIClass hspi(HSPI);
 static Adafruit_ST7789 tft = Adafruit_ST7789(&hspi, LCD_CS, LCD_DC, LCD_RST);
 
-// physical display: 170x320 (portrait)
 #define D_W  170
 #define D_H  320
 
@@ -24,25 +23,22 @@ static Adafruit_ST7789 tft = Adafruit_ST7789(&hspi, LCD_CS, LCD_DC, LCD_RST);
 #define C_BLUE        0x001F
 #define C_PURPLE      0x780F
 
-// theme
 #define C_BG          C_BLACK
 #define C_HEADER_BG   0x0390
 #define C_TEXT        C_WHITE
 #define C_ACCENT      C_YELLOW
 #define C_DIM         C_DARK_GRAY
-
-// board square colors
 #define C_SQ_LIGHT    0xF7BE
 #define C_SQ_DARK     0x9A40
 
-// --- layout (170x320 portrait) -----------------------------------------------
+// --- layout ------------------------------------------------------------------
 //
-//  y=0    header bar (28px)
+//  y=0    header (28px)
 //  y=28   turn indicator (20px)
 //  y=48   last move (18px)
-//  y=66   status msg (18px)
-//  y=84   mini board (160x160, 20px/sq, x=5)
-//  y=244  padding (16px)
+//  y=66   status (18px)
+//  y=84   board (160x160, 20px/sq, x=5)
+//  y=244  padding
 //  y=260  eval bar (20px)
 //  y=280  padding to 320
 
@@ -55,13 +51,79 @@ static Adafruit_ST7789 tft = Adafruit_ST7789(&hspi, LCD_CS, LCD_DC, LCD_RST);
 #define STATUS_Y    66
 #define STATUS_H    18
 #define BOARD_SQ    20
-#define BOARD_PX    (BOARD_SQ * 8)   // 160
-#define BOARD_X     ((D_W - BOARD_PX) / 2)   // 5
+#define BOARD_PX    (BOARD_SQ * 8)
+#define BOARD_X     ((D_W - BOARD_PX) / 2)
 #define BOARD_Y     84
 #define EVAL_Y      260
 #define EVAL_H      20
 
-// --- normal game screen draw functions ---------------------------------------
+// --- FEN board parser --------------------------------------------------------
+//
+// parses the piece-placement section of a FEN string into a 64-byte array
+// where each entry is a piece char ('P','n','K', etc.) or 0 for empty.
+// used by draw_mini_board to render the right piece on each square.
+
+static void fen_to_squares(const char *fen, char *squares) {
+    memset(squares, 0, 64);
+    int rank = 7, file = 0;
+    for (const char *p = fen; *p && *p != ' '; p++) {
+        char c = *p;
+        if (c == '/') { rank--; file = 0; }
+        else if (c >= '1' && c <= '8') { file += c - '0'; }
+        else {
+            if (file < 8 && rank >= 0)
+                squares[rank * 8 + file] = c;
+            file++;
+        }
+    }
+}
+
+// --- board drawing -----------------------------------------------------------
+
+// draw one square at pixel coords (px, py) with the given piece char (0 = empty)
+// white pieces = uppercase, black pieces = lowercase
+static void draw_board_square(int px, int py, bool light_sq, char piece) {
+    uint16_t sq_color = light_sq ? C_SQ_LIGHT : C_SQ_DARK;
+    tft.fillRect(px, py, BOARD_SQ, BOARD_SQ, sq_color);
+
+    if (!piece) return;
+
+    bool is_white = (piece >= 'A' && piece <= 'Z');
+    char upper    = (piece >= 'a') ? piece - 32 : piece;
+
+    // draw piece circle -- white pieces: white fill, dark outline
+    //                       black pieces: dark fill, white outline
+    uint16_t fill    = is_white ? C_WHITE     : 0x2945;
+    uint16_t outline = is_white ? C_DARK_GRAY : C_WHITE;
+    int cx = px + BOARD_SQ / 2;
+    int cy = py + BOARD_SQ / 2;
+    tft.fillCircle(cx, cy, BOARD_SQ / 2 - 2, fill);
+    tft.drawCircle(cx, cy, BOARD_SQ / 2 - 2, outline);
+
+    // letter inside circle -- identifies piece type
+    // setTextSize(1) gives 6x8px characters, center them in the circle
+    tft.setTextSize(1);
+    tft.setTextColor(is_white ? C_BLACK : C_WHITE);
+    tft.setCursor(cx - 3, cy - 4);
+    tft.print(upper);
+}
+
+static void draw_mini_board(const char *fen) {
+    char squares[64];
+    fen_to_squares(fen, squares);
+
+    for (int row = 0; row < 8; row++) {
+        for (int col = 0; col < 8; col++) {
+            int px = BOARD_X + col * BOARD_SQ;
+            int py = BOARD_Y + (7 - row) * BOARD_SQ;  // rank 1 at bottom
+            draw_board_square(px, py, (row + col) % 2 == 0,
+                              squares[row * 8 + col]);
+        }
+    }
+    tft.drawRect(BOARD_X - 1, BOARD_Y - 1, BOARD_PX + 2, BOARD_PX + 2, C_LIGHT_GRAY);
+}
+
+// --- game screen draw functions ----------------------------------------------
 
 static void draw_header(GameMode_t mode) {
     tft.fillRect(0, HEADER_Y, D_W, HEADER_H, C_HEADER_BG);
@@ -73,10 +135,9 @@ static void draw_header(GameMode_t mode) {
     const char *label;
     uint16_t    color;
     switch (mode) {
-        case GAME_MODE_LOCAL:    label = "LOCAL";    color = C_BLUE;      break;
-        case GAME_MODE_LICHESS:  label = "LICHESS";  color = C_GREEN;     break;
-        case GAME_MODE_ANALYSIS: label = "ANALYSIS"; color = C_YELLOW;    break;
-        default:                 label = "IDLE";     color = C_DARK_GRAY; break;
+        case GAME_MODE_LOCAL:   label = "LOCAL";   color = C_BLUE;      break;
+        case GAME_MODE_LICHESS: label = "LICHESS"; color = C_GREEN;     break;
+        default:                label = "IDLE";    color = C_DARK_GRAY; break;
     }
     tft.fillRect(D_W - 54, 7, 52, 14, color);
     tft.setTextColor(C_BLACK);
@@ -141,50 +202,26 @@ static void draw_eval_bar(int16_t eval_cp) {
     tft.print(buf);
 }
 
-static void draw_mini_board(uint64_t occupied) {
-    for (int row = 0; row < 8; row++) {
-        for (int col = 0; col < 8; col++) {
-            uint8_t sq  = (uint8_t)(row * 8 + col);
-            bool    lit = (row + col) % 2 == 0;
-            int x = BOARD_X + col * BOARD_SQ;
-            int y = BOARD_Y + (7 - row) * BOARD_SQ;  // rank 1 at bottom
-            tft.fillRect(x, y, BOARD_SQ, BOARD_SQ, lit ? C_SQ_LIGHT : C_SQ_DARK);
-            if (occupied & (1ULL << sq))
-                tft.fillCircle(x + BOARD_SQ / 2, y + BOARD_SQ / 2,
-                               BOARD_SQ / 2 - 2, C_WHITE);
-        }
-    }
-    tft.drawRect(BOARD_X - 1, BOARD_Y - 1, BOARD_PX + 2, BOARD_PX + 2, C_LIGHT_GRAY);
-}
-
 static void render_game_state(const GameState_t *gs) {
     tft.fillScreen(C_BG);
     draw_header(gs->mode);
     draw_turn_indicator(gs->active_color);
     draw_last_move(gs->last_move);
     draw_status(gs->status_msg);
-    draw_mini_board(gs->occupied);
+    draw_mini_board(gs->fen);
     draw_eval_bar(gs->eval_cp);
 }
 
 // --- promotion picker screen -------------------------------------------------
 //
-// replaces the normal game view while PROMO_SELECTING.
-// shows 4 piece options in a 2x2 grid with the cursor highlighted.
-// BTN_CYCLE cycles the highlight, BTN_CONFIRM commits.
+// 2x2 tile grid, cycle with BTN_CYCLE, confirm with BTN_CONFIRM
 //
-// layout (centered in 170x320):
-//
-//   y=0    header (28px, reused)
-//   y=40   "PROMOTE PAWN" title
-//   y=70   2x2 grid of piece tiles (each 70x80px)
-//            col0 x=5,  col1 x=90
-//            row0 y=70  (queen, rook)
-//            row1 y=160 (bishop, knight)
-//   y=260  hint text
-//   y=290  button legend
+//  y=0    header (reused)
+//  y=30   purple title bar
+//  y=62   row 0 tiles: queen (x=5), rook (x=93)
+//  y=150  row 1 tiles: bishop (x=5), knight (x=93)
+//  y=240  button legend
 
-// piece tile colors (RGB565)
 static const uint16_t PROMO_COLORS[4] = {
     0xC600,   // queen -- gold
     0x07FF,   // rook -- cyan
@@ -211,15 +248,13 @@ static void draw_promo_tile(int idx, bool selected) {
     tft.fillRect(x, y, TILE_W, TILE_H, bg);
     tft.drawRect(x, y, TILE_W, TILE_H, border);
     if (selected)
-        tft.drawRect(x + 1, y + 1, TILE_W - 2, TILE_H - 2, border);  // double border on selected
+        tft.drawRect(x + 1, y + 1, TILE_W - 2, TILE_H - 2, border);
 
-    // piece initial letter -- large, centered in tile
     tft.setTextColor(fg);
     tft.setTextSize(4);
     tft.setCursor(x + TILE_W / 2 - 12, y + 14);
     tft.print(PROMO_LABELS[idx][0]);
 
-    // piece name -- small, below letter
     tft.setTextSize(1);
     tft.setCursor(x + 4, y + TILE_H - 14);
     tft.print(PROMO_LABELS[idx]);
@@ -227,22 +262,17 @@ static void draw_promo_tile(int idx, bool selected) {
 
 static void render_promo_picker(const GameState_t *gs) {
     tft.fillScreen(C_BG);
-
-    // reuse header
     draw_header(gs->mode);
 
-    // title bar
     tft.fillRect(0, 30, D_W, 28, C_PURPLE);
     tft.setTextColor(C_WHITE);
     tft.setTextSize(1);
     tft.setCursor(28, 40);
     tft.print("PROMOTE PAWN -- choose piece");
 
-    // 2x2 tile grid
     for (int i = 0; i < 4; i++)
         draw_promo_tile(i, i == gs->promo_cursor);
 
-    // button legend at bottom
     tft.setTextColor(C_DIM);
     tft.setTextSize(1);
     tft.setCursor(4, 240);
@@ -251,8 +281,7 @@ static void render_promo_picker(const GameState_t *gs) {
     tft.print("[CONFIRM] lock in choice");
 }
 
-// partial redraw for picker -- only re-draws the tiles, not the full screen.
-// called when promo_cursor changes so we don't flicker the whole display.
+// only redraws the tiles when cursor moves -- avoids full-screen flicker
 static void redraw_promo_tiles(const GameState_t *gs) {
     for (int i = 0; i < 4; i++)
         draw_promo_tile(i, i == gs->promo_cursor);
@@ -271,7 +300,6 @@ void task_LcdDisplay(void *pvParameters) {
         digitalWrite(LCD_BL, HIGH);
     }
 
-    // splash
     tft.setTextColor(C_WHITE);
     tft.setTextSize(2);
     tft.setCursor(14, 140);
@@ -282,24 +310,20 @@ void task_LcdDisplay(void *pvParameters) {
     tft.print("initializing...");
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    GameState_t  gs       = {};
+    GameState_t  gs                = {};
     PromoState_t last_promo_state  = PROMO_NONE;
-    uint8_t      last_promo_cursor = 0xFF;  // force initial draw
+    uint8_t      last_promo_cursor = 0xFF;
 
     for (;;) {
         if (xQueueReceive(xQ_GameState, &gs, pdMS_TO_TICKS(250)) != pdTRUE)
             continue;
 
         if (gs.promo_state == PROMO_SELECTING) {
-            if (last_promo_state != PROMO_SELECTING) {
-                // just entered picker -- full redraw
+            if (last_promo_state != PROMO_SELECTING)
                 render_promo_picker(&gs);
-            } else if (gs.promo_cursor != last_promo_cursor) {
-                // cursor moved -- only redraw tiles to avoid flicker
+            else if (gs.promo_cursor != last_promo_cursor)
                 redraw_promo_tiles(&gs);
-            }
         } else {
-            // normal game screen
             render_game_state(&gs);
         }
 
