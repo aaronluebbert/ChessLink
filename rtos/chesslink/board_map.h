@@ -2,31 +2,32 @@
 //
 // canonical square: sq = rank*8 + file, a1=0 .. h8=63 (file 0=a..7=h, rank 0..7)
 //
-// LED chain (WS2812B DOUT from the ESP): h1,h2,h3,h4,h5,h6,h7,h8, g1,g2,...,a8
-//   -> files run h,g,f,...,a; within a file, ranks 1..8.
-//   led_index(sq): file = sq&7 (0=a..7=h), rank = sq>>3.
-//     chain position = (7 - file) * 8 + rank
+// both maps below come from the validated single-chain detection sketch
 //
-// shift-register read (bit order clocked out of the HC165 chain):
-//   h8,h7,h6,h5,h4,h3,h2,h1, g8,g7,...,a1
-//   -> files run h,g,...,a; within a file, ranks 8..1.
-//   sensor_sq(readidx): file = 7 - (readidx/8), rank = 7 - (readidx%8)
+// sensor read (one 64-bit HC165 daisy chain on SR_MISO, bit-banged):
+//   bits clock out in canonical order a1,b1..h1, a2..h2, ... a8..h8
+//   so read-index i maps straight to square i, no math needed
+//   A3144 is active-low, a LOW bit means a piece is on the square
+//
+// LED chain (WS2812B DOUT from the ESP):
+//   LED 0 = h8, data runs right to left across each rank (h..a), then drops
+//   to the rank below: h8,g8..a8, h7..a7, ... h1..a1
+//   led = (7 - rank)*8 + (7 - file)
 
 #ifndef CHESSLINK_BOARD_MAP_H
 #define CHESSLINK_BOARD_MAP_H
 
-// canonical square -> position in the WS2812B chain (0 = first LED = h1)
+// canonical square -> position in the WS2812B chain (0 = first LED = h8)
 static inline int cl_led_index(int sq) {
     int file = sq & 7, rank = sq >> 3;
-    return (7 - file) * 8 + rank;
+    return (7 - rank) * 8 + (7 - file);
 }
 
 // read-index in the shift-register bitstream -> canonical square
-// (read-index 0 = first bit clocked out = h8)
+// the chain clocks out in canonical order, so this is the identity map
+// (read-index 0 = first bit clocked out = a1 = sq 0)
 static inline int cl_sensor_sq(int readidx) {
-    int file = 7 - (readidx / 8);
-    int rank = 7 - (readidx % 8);
-    return rank * 8 + file;
+    return readidx;
 }
 
 #endif

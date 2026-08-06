@@ -9,6 +9,8 @@ QueueHandle_t xQ_GameState;
 QueueHandle_t xQ_PlayerMove;
 QueueHandle_t xQ_OpponentMove;
 QueueHandle_t xQ_ButtonEvent;
+QueueHandle_t xQ_NetCmd;
+QueueHandle_t xQ_NetUpdate;
 
 // --- setup -------------------------------------------------------------------
 
@@ -25,9 +27,12 @@ void setup() {
     xQ_PlayerMove   = xQueueCreate(Q_MOVE_DEPTH,          sizeof(MoveEvent_t));
     xQ_OpponentMove = xQueueCreate(Q_MOVE_DEPTH,          sizeof(MoveEvent_t));
     xQ_ButtonEvent  = xQueueCreate(Q_BUTTON_DEPTH,        sizeof(ButtonEvent_t));
+    xQ_NetCmd       = xQueueCreate(Q_NET_CMD_DEPTH,        sizeof(NetCmdMsg_t));
+    xQ_NetUpdate    = xQueueCreate(Q_NET_UPDATE_DEPTH,     sizeof(NetUpdate_t));
 
     if (!xQ_BoardState || !xQ_LedCmd || !xQ_GameState ||
-        !xQ_PlayerMove || !xQ_OpponentMove || !xQ_ButtonEvent) {
+        !xQ_PlayerMove || !xQ_OpponentMove || !xQ_ButtonEvent ||
+        !xQ_NetCmd || !xQ_NetUpdate) {
         Serial.println("[chesslink] fatal: queue allocation failed");
         while (1) {}
     }

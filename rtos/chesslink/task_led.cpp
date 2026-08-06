@@ -1,13 +1,14 @@
 #include "chesslink.h"
+#include "board_map.h"
 #include <FastLED.h>
 
 // - LED buffer -
 
 static CRGB leds[NUM_SQUARES];
 
-// TODO: remap if physical strip routing is serpentine or column-major
+// validated chain order: LED 0 = h8, h..a across each rank, ranks 8..1
 static inline uint8_t sq_to_led(uint8_t sq) {
-    return sq;
+    return (uint8_t)cl_led_index(sq);
 }
 
 // - command handlers -
@@ -22,15 +23,17 @@ static void apply_led_cmd(const LedCmd_t *cmd) {
             break;
         }
 
-        case LED_CMD_SET_ALL: {
-            CRGB color(cmd->r, cmd->g, cmd->b);
-            for (int i = 0; i < NUM_SQUARES; i++) leds[i] = color;
-            break;
-        }
-
         case LED_CMD_CLEAR:
             FastLED.clear();
             break;
+
+        case LED_CMD_HILITE: {
+            // only the masked squares light up, everything else goes dark
+            CRGB on(cmd->r, cmd->g, cmd->b);
+            for (int sq = 0; sq < NUM_SQUARES; sq++)
+                leds[sq_to_led(sq)] = (cmd->mask & (1ULL << sq)) ? on : CRGB(0, 0, 0);
+            break;
+        }
 
         case LED_CMD_PATTERN: {
             // lit squares get full color, unlit squares get ~10% for context
@@ -50,7 +53,7 @@ static void apply_led_cmd(const LedCmd_t *cmd) {
 
 void task_LedControl(void *pvParameters) {
     FastLED.addLeds<WS2812B, LED_DATA_PIN, GRB>(leds, NUM_SQUARES);
-    FastLED.setBrightness(64);  // ~25%, increase after thermal check
+    FastLED.setBrightness(48);  // increase after thermal check
     FastLED.clear(true);
 
     LedCmd_t cmd;

@@ -535,10 +535,6 @@ static int gen_pseudo(const Position *pos, Move *moves) {
 // legal move generation -- filter pseudo-legal moves by checking for self-check
 // =============================================================================
 
-// rank 3 and 6 needed for pawn double push -- define here since not in header
-#define RANK_3  0x0000000000FF0000ULL
-#define RANK_6  0x0000FF0000000000ULL
-
 int gen_legal_moves(const Position *pos, Move *moves) {
     Move pseudo[MAX_MOVES];
     int  pcnt = gen_pseudo(pos, pseudo);
@@ -573,10 +569,6 @@ BB legal_destinations(const Position *pos, uint8_t from_sq) {
     for (int i = 0; i < cnt; i++)
         dest |= BB_SQ(MV_TO(moves[i]));
     return dest;
-}
-
-bool is_legal(const Position *pos, uint8_t from_sq, uint8_t to_sq) {
-    return (legal_destinations(pos, from_sq) & BB_SQ(to_sq)) != 0;
 }
 
 // =============================================================================

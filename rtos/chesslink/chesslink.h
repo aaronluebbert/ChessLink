@@ -14,7 +14,7 @@
 #define SR_LOAD       5    // active-low parallel load, bit-banged
 
 // WS2812B via 74AHCT125 level shifter
-#define LED_DATA_PIN  4    // RMT output -> level shifter -> LED_DATA_5V
+#define LED_DATA_PIN  25   // RMT output -> level shifter -> LED_DATA_5V (PCB v3, matches validated sketch)
 
 // ST7789 LCD (HSPI) -- 170x320
 #define LCD_MOSI      13
@@ -25,8 +25,10 @@
 #define LCD_BL        32
 
 // tactile buttons (input-only pins, no internal pullup -- needs external 10k to 3.3V)
-#define BTN_CYCLE     34   // cycle through promotion choices
-#define BTN_CONFIRM   35   // confirm selection
+#define BTN_UP        36   // menu up / previous
+#define BTN_DOWN      39   // menu down / next
+#define BTN_CONFIRM   34   // confirm / select
+#define BTN_CANCEL    35   // cancel / back
 
 // --- board geometry ----------------------------------------------------------
 
@@ -65,6 +67,8 @@
 #define Q_GAME_STATE_DEPTH    4
 #define Q_MOVE_DEPTH          4
 #define Q_BUTTON_DEPTH        8
+#define Q_NET_CMD_DEPTH       4
+#define Q_NET_UPDATE_DEPTH    4
 
 // timing
 #define SENSOR_SCAN_MS    20
@@ -77,14 +81,13 @@
 
 typedef struct {
     uint64_t occupied;
-    uint32_t timestamp_ms;
 } BoardState_t;
 
 typedef enum {
     LED_CMD_SET_SQUARE,
-    LED_CMD_SET_ALL,
     LED_CMD_CLEAR,
     LED_CMD_PATTERN,
+    LED_CMD_HILITE,     // light the masked squares, all others off
 } LedCmdType_t;
 
 typedef struct {
@@ -95,8 +98,10 @@ typedef struct {
 } LedCmd_t;
 
 typedef enum {
-    BTN_EVT_CYCLE,
+    BTN_EVT_UP,
+    BTN_EVT_DOWN,
     BTN_EVT_CONFIRM,
+    BTN_EVT_CANCEL,
 } ButtonEvent_t;
 
 typedef enum {
@@ -105,45 +110,146 @@ typedef enum {
 } PromoState_t;
 
 typedef enum {
-    GAME_MODE_IDLE,
+    GAME_MODE_IDLE,       // sitting in the menu, no game running
     GAME_MODE_LOCAL,
     GAME_MODE_LICHESS,
 } GameMode_t;
+
+// top-level screen the display shows
+typedef enum {
+    UI_MENU,       // mode-select menu
+    UI_ONLINE_CFG, // online rated-match config submenu
+    UI_BOT_CFG,    // play-computer (Stockfish) config submenu
+    UI_GAME,       // in a game -- board / match / promo screens
+    UI_SETUP,      // WiFi/token captive-portal instructions
+    UI_NOTICE,     // transient status ("seeking...") -- no button prompt
+    UI_CONFIRM,    // "leave game?" yes/no prompt
+    UI_GAMEOVER,   // terminal result / error -- any button returns to the menu
+} UiScreen_t;
+
+// mode-select menu items, in cursor order
+#define MENU_ITEM_COUNT  4
+#define MENU_ITEM_LOCAL  0
+#define MENU_ITEM_ONLINE 1
+#define MENU_ITEM_BOT    2
+#define MENU_ITEM_SETUP  3
+
+// time-control preset (min = 0 means untimed). two lists: the online rated one
+// (all timed) and the bot one (adds untimed)
+typedef struct { uint16_t min; uint8_t inc; const char *label; } TimePreset_t;
+extern const TimePreset_t ONLINE_TIME_PRESETS[];
+extern const int          ONLINE_TIME_COUNT;
+extern const TimePreset_t BOT_TIME_PRESETS[];
+extern const int          BOT_TIME_COUNT;
+
+// online rated-match config rows
+#define CFG_ROW_TIME   0
+#define CFG_ROW_RATED  1
+#define CFG_ROW_START  2
+#define CFG_ROW_COUNT  3
+
+// play-computer config rows + level range (lichess Stockfish is 1..8)
+#define BOT_ROW_LEVEL  0
+#define BOT_ROW_TIME   1
+#define BOT_ROW_COLOR  2
+#define BOT_ROW_START  3
+#define BOT_ROW_COUNT  4
+#define BOT_LEVEL_MIN  1
+#define BOT_LEVEL_MAX  8
+
+// soft-AP shown during first-boot / on-demand WiFi + token setup
+#define WIFI_SETUP_AP_SSID "ChessLink-Setup"
+#define WIFI_SETUP_AP_PASS "chesslink12"
+
+// commands from the game task to the network task
+typedef enum {
+    NET_CMD_START_ONLINE,   // seek a human lichess game, then stream it
+    NET_CMD_START_BOT,      // challenge Stockfish, then stream it
+    NET_CMD_RESIGN,         // resign/abort the current game (read mid-stream)
+    NET_CMD_OPEN_SETUP,     // (re)open the captive portal to set WiFi + token
+} NetCmd_t;
+
+// message on xQ_NetCmd -- the command plus game parameters
+typedef struct {
+    NetCmd_t type;
+    uint16_t time_min;      // initial clock in minutes (0 = untimed, bot only)
+    uint8_t  inc_sec;       // increment, seconds
+    bool     rated;         // online human match
+    uint8_t  level;         // bot Stockfish level 1..8
+    uint8_t  color;         // bot color: 0=white 1=black 2=random
+} NetCmdMsg_t;
+
+// coarse network state the network task reports up for the display
+typedef enum {
+    NET_STATUS_SETUP,       // captive portal is up, waiting for the phone
+    NET_STATUS_ONLINE,      // connected to WiFi, ready
+} NetStatus_t;
+
+// status pushed from the network task to the game task during an online game:
+// player identities (once, at game start) and/or fresh clocks (on every packet
+// that carries them) so the match screen stays in sync with the server
+typedef struct {
+    bool        has_status;    // the status field below is valid
+    NetStatus_t status;
+
+    bool        has_result;    // game finished -- result_text is valid
+    char        result_text[32];
+
+    bool     has_meta;      // my_/opp_ name, rating and color are valid
+    char     my_name[20];
+    char     opp_name[20];
+    uint16_t my_rating;
+    uint16_t opp_rating;
+    uint8_t  my_color;      // 0=white 1=black
+
+    bool     has_clocks;    // the clock fields below are valid
+    uint32_t white_clock_ms;
+    uint32_t black_clock_ms;
+} NetUpdate_t;
 
 typedef struct {
     GameMode_t  mode;
     char        fen[92];
     uint8_t     active_color;     // 0=white, 1=black
-    int16_t     eval_cp;          // centipawn eval, INT16_MIN if unknown
     char        last_move[6];
     char        status_msg[32];
+
+    // top-level UI
+    UiScreen_t  ui_screen;     // menu vs in-game
+    uint8_t     menu_cursor;   // highlighted item when ui_screen == UI_MENU
+
+    // config submenus (UI_ONLINE_CFG / UI_BOT_CFG)
+    uint8_t     cfg_cursor;    // CFG_ROW_* / BOT_ROW_*
+    uint8_t     cfg_time_idx;  // index into the active time-preset list
+    bool        cfg_rated;     // online
+    uint8_t     cfg_level;     // bot: 1..8
+    uint8_t     cfg_color;     // bot: 0=white 1=black 2=random
 
     // clock data from lichess (ms remaining for each side, 0 if not in a timed game)
     uint32_t    white_clock_ms;
     uint32_t    black_clock_ms;
-    uint32_t    white_inc_ms;
-    uint32_t    black_inc_ms;
+
+    // live-match players, filled for online games (blank/0 = unknown)
+    // my_color says which physical clock (white/black) is mine, so the match
+    // screen can map the white/black clocks onto the "me" and "opp" rows
+    char        my_name[20];
+    char        opp_name[20];
+    uint16_t    my_rating;
+    uint16_t    opp_rating;
+    uint8_t     my_color;         // 0=white, 1=black
 
     // promotion picker
     PromoState_t promo_state;
     uint8_t      promo_cursor;    // 0=queen 1=rook 2=bishop 3=knight
 } GameState_t;
 
-typedef enum {
-    MOVE_SRC_PLAYER,
-    MOVE_SRC_OPPONENT,
-} MoveSrc_t;
-
 typedef struct {
-    MoveSrc_t src;
     uint8_t   from_sq;
     uint8_t   to_sq;
     char      uci[6];
     // clock data piggy-backed on opponent move events (0 if not a timed game)
     uint32_t  white_clock_ms;
     uint32_t  black_clock_ms;
-    uint32_t  white_inc_ms;
-    uint32_t  black_inc_ms;
 } MoveEvent_t;
 
 // --- queue handles -----------------------------------------------------------
@@ -154,6 +260,8 @@ extern QueueHandle_t xQ_GameState;
 extern QueueHandle_t xQ_PlayerMove;
 extern QueueHandle_t xQ_OpponentMove;
 extern QueueHandle_t xQ_ButtonEvent;
+extern QueueHandle_t xQ_NetCmd;
+extern QueueHandle_t xQ_NetUpdate;
 
 // --- task declarations -------------------------------------------------------
 

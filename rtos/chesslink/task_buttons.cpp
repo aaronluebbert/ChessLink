@@ -9,31 +9,32 @@
 // debounce: track how long each pin has been stable, fire event on
 // leading edge after BTN_DEBOUNCE_MS of consistent LOW.
 
+#define NUM_BTNS 4
+
 void task_Buttons(void *pvParameters) {
-    pinMode(BTN_CYCLE,   INPUT);
-    pinMode(BTN_CONFIRM, INPUT);
+    const int         pins[NUM_BTNS] = { BTN_UP,     BTN_DOWN,     BTN_CONFIRM,     BTN_CANCEL     };
+    const ButtonEvent_t evts[NUM_BTNS] = { BTN_EVT_UP, BTN_EVT_DOWN, BTN_EVT_CONFIRM, BTN_EVT_CANCEL };
 
     // state per button
     struct BtnState {
         bool     last_raw;     // last raw digitalRead
         bool     confirmed;    // last debounced state
         uint32_t stable_since; // millis() when current raw state started
-    } btns[2] = {};
+    } btns[NUM_BTNS] = {};
 
     // initialize to current pin state so we don't fire on boot
-    btns[0].last_raw = btns[0].confirmed = digitalRead(BTN_CYCLE);
-    btns[1].last_raw = btns[1].confirmed = digitalRead(BTN_CONFIRM);
-    btns[0].stable_since = btns[1].stable_since = millis();
-
-    const int pins[2]            = { BTN_CYCLE, BTN_CONFIRM };
-    const ButtonEvent_t evts[2]  = { BTN_EVT_CYCLE, BTN_EVT_CONFIRM };
+    for (int i = 0; i < NUM_BTNS; i++) {
+        pinMode(pins[i], INPUT);
+        btns[i].last_raw = btns[i].confirmed = digitalRead(pins[i]);
+        btns[i].stable_since = millis();
+    }
 
     TickType_t xLastWake = xTaskGetTickCount();
 
     for (;;) {
         uint32_t now = millis();
 
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < NUM_BTNS; i++) {
             bool raw = digitalRead(pins[i]);
 
             if (raw != btns[i].last_raw) {

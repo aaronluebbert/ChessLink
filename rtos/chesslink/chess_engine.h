@@ -17,8 +17,10 @@ typedef uint64_t BB;
 // rank masks
 #define RANK_1  0x00000000000000FFULL
 #define RANK_2  0x000000000000FF00ULL
+#define RANK_3  0x0000000000FF0000ULL
 #define RANK_4  0x00000000FF000000ULL
 #define RANK_5  0x000000FF00000000ULL
+#define RANK_6  0x0000FF0000000000ULL
 #define RANK_7  0x00FF000000000000ULL
 #define RANK_8  0xFF00000000000000ULL
 
@@ -122,9 +124,6 @@ int  gen_legal_moves_from(const Position *pos, uint8_t from_sq, Move *moves);
 
 // bitmask of all squares the piece on from_sq can legally reach
 BB   legal_destinations(const Position *pos, uint8_t from_sq);
-
-// quick yes/no legality check for a from->to pair
-bool is_legal(const Position *pos, uint8_t from_sq, uint8_t to_sq);
 
 // is the given color's king currently in check?
 bool in_check(const Position *pos, Color c);

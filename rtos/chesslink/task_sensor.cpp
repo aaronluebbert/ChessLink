@@ -1,73 +1,44 @@
 #include "chesslink.h"
-#include <SPI.h>
+#include "board_map.h"
 
 // --- chain topology ----------------------------------------------------------
 //
-// 8 SN74HC165 shift registers, one per rank
+// all 64 sensors are one HC165 daisy chain on a single data line (SR_MISO)
+// read is bit-banged: latch once, then clock out 64 bits in a row
 //
-// physical layout (sitting at the board, ESP PCB to the right):
+// the chain clocks out in canonical order a1,b1..h1, a2..h2, ... a8..h8, so
+// read-index i is square i (see cl_sensor_sq in board_map.h, identity map)
 //
-//   rank 8 SR  ->  rank 7 SR  ->  ...  ->  rank 1 SR  ->  GPIO19 (MISO)
-//   (furthest from ESP)                     (QH to ESP)
-//
-// rank PCBs detect a full rank: each sensor on a given rank connects to
-// the SR input for its file. wiring within each SR:
-//
-//   A-file sensor -> input H (MSB, clocked out first)
-//   B-file sensor -> input G
-//   ...
-//   H-file sensor -> input A (LSB, clocked out last)
-//
-// so after SPI.transfer x8 with MSBFIRST, the raw uint64 looks like:
-//
-//   bits 63..56 = rank 8  (bit63=A8, bit62=B8, ... bit56=H8)
-//   bits 55..48 = rank 7
-//   ...
-//   bits  7.. 0 = rank 1  (bit7=A1,  bit6=B1,  ... bit0=H1)
-//
-// to get canonical sq = rank*8 + file from raw bit position p:
-//   rank = p / 8
-//   file = 7 - (p % 8)   // H->A maps bits 0->7, so invert
-//   sq   = rank*8 + file
-//
-// A3144 output is active-low, a 0 bit means magnet detected (occupied)
+// A3144 output is active-low, a LOW bit means magnet detected (occupied)
+// this replaces the old per-rank SPI read, the LCD keeps HSPI to itself so
+// nothing else touches SR_SCLK now
 
 // --- helpers -----------------------------------------------------------------
 
 // pulse SR_LOAD low to latch all parallel inputs at once
-// HC165 latches on falling edge of PL, hold 1us before clocking
+// HC165 latches on the falling edge of PL, hold a moment before clocking
 static inline void sr_latch() {
     digitalWrite(SR_LOAD, LOW);
-    delayMicroseconds(1);
+    delayMicroseconds(5);
     digitalWrite(SR_LOAD, HIGH);
+    delayMicroseconds(5);
 }
 
-// clock out all 64 bits over VSPI
-// rank 8 byte comes out first (MSB of result), rank 1 last
+// latch, then clock out all 64 bits, reading one bit per tick from SR_MISO
+// bit is read before the clock pulse, first bit out is QH of the chain
 static uint64_t sr_read_all() {
     sr_latch();
 
-    uint64_t raw = 0;
-    for (int i = 7; i >= 0; i--) {
-        uint8_t b = SPI.transfer(0x00);
-        raw |= ((uint64_t)b << (i * 8));
-    }
-    return raw;
-}
-
-// convert raw 64-bit SR read to occupied bitmask in canonical sq indexing
-// raw bit p -> rank = p/8, file = 7-(p%8), sq = rank*8+file
-// A3144 is active-low so invert: bit=0 means occupied
-static uint64_t raw_to_occupied(uint64_t raw) {
     uint64_t occupied = 0;
-    for (int p = 0; p < 64; p++) {
-        bool sensor_low = !((raw >> p) & 1);
-        if (sensor_low) {
-            int rank = p / 8;
-            int file = 7 - (p % 8);
-            int sq   = rank * 8 + file;
-            occupied |= (1ULL << sq);
-        }
+    for (int bit = 0; bit < NUM_SQUARES; bit++) {
+        // active-low, a LOW reading means a piece is on this square
+        if (!digitalRead(SR_MISO))
+            occupied |= (1ULL << cl_sensor_sq(bit));
+
+        digitalWrite(SR_SCLK, HIGH);
+        delayMicroseconds(5);
+        digitalWrite(SR_SCLK, LOW);
+        delayMicroseconds(5);
     }
     return occupied;
 }
@@ -76,11 +47,13 @@ static uint64_t raw_to_occupied(uint64_t raw) {
 
 void task_SensorScan(void *pvParameters) {
     pinMode(SR_LOAD, OUTPUT);
-    digitalWrite(SR_LOAD, HIGH);  // idle high, active-low load
+    digitalWrite(SR_LOAD, HIGH);      // idle high, active-low load
 
-    // VSPI, mode 1, 1 MHz (conservative, bump after hardware validation)
-    SPI.begin(SR_SCLK, SR_MISO, /*MOSI*/-1, /*SS*/-1);
-    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1));
+    pinMode(SR_SCLK, OUTPUT);
+    digitalWrite(SR_SCLK, LOW);       // clock idles low, bit-banged
+
+    // pullup so an unconnected chain reads high (empty) instead of stuck-on
+    pinMode(SR_MISO, INPUT_PULLUP);
 
     uint64_t prev_confirmed = 0;
     uint64_t candidate      = 0;
@@ -89,7 +62,7 @@ void task_SensorScan(void *pvParameters) {
     TickType_t xLastWake = xTaskGetTickCount();
 
     for (;;) {
-        uint64_t occupied = raw_to_occupied(sr_read_all());
+        uint64_t occupied = sr_read_all();
 
         // need DEBOUNCE_SCANS identical reads in a row before accepting a change
         if (occupied == candidate) {
@@ -103,10 +76,7 @@ void task_SensorScan(void *pvParameters) {
             prev_confirmed = occupied;
             stable_count   = 0;
 
-            BoardState_t msg = {
-                .occupied     = occupied,
-                .timestamp_ms = (uint32_t)xTaskGetTickCount() * portTICK_PERIOD_MS,
-            };
+            BoardState_t msg = { .occupied = occupied };
 
             // drop oldest rather than blocking the scan loop
             if (xQueueSend(xQ_BoardState, &msg, 0) != pdTRUE) {
@@ -119,6 +89,5 @@ void task_SensorScan(void *pvParameters) {
         vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(SENSOR_SCAN_MS));
     }
 
-    SPI.endTransaction();
     vTaskDelete(NULL);
 }
