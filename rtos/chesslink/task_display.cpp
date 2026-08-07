@@ -74,6 +74,7 @@ static void draw_header(GameMode_t mode) {
     switch (mode) {
         case GAME_MODE_LOCAL:   label = "LOCAL";   color = C_BLUE;      break;
         case GAME_MODE_LICHESS: label = "LICHESS"; color = C_GREEN;     break;
+        case GAME_MODE_REPLAY:  label = "STUDY";   color = C_ACCENT;    break;
         default:                label = "IDLE";    color = C_DARK_GRAY; break;
     }
     tft.fillRect(D_W - 54, 7, 52, 14, color);
@@ -213,7 +214,8 @@ static void draw_match_clocks(uint32_t my_ms, uint32_t opp_ms, bool my_turn) {
 // shown at boot and whenever no game is running. UP/DOWN move the highlight,
 // CONFIRM enters the mode. labels line up with the MENU_ITEM_* indices
 
-static const char *MENU_ITEMS[MENU_ITEM_COUNT] = { "Local Game", "Online Game", "Play Bot", "WiFi Setup" };
+static const char *MENU_ITEMS[MENU_ITEM_COUNT] =
+    { "Local Game", "Online Game", "Play Bot", "Famous Games", "WiFi Setup" };
 
 static void render_menu(const GameState_t *gs) {
     tft.fillScreen(C_BG);
@@ -225,16 +227,16 @@ static void render_menu(const GameState_t *gs) {
     tft.print("select a mode");
 
     for (int i = 0; i < MENU_ITEM_COUNT; i++) {
-        int  y   = 74 + i * 46;
+        int  y   = 64 + i * 44;
         bool sel = (i == gs->menu_cursor);
 
-        tft.fillRect(8, y, D_W - 16, 38, sel ? C_HEADER_BG : C_DARK_GRAY);
-        tft.drawRect(8, y, D_W - 16, 38, sel ? C_ACCENT : C_LIGHT_GRAY);
-        if (sel) tft.drawRect(9, y + 1, D_W - 18, 36, C_ACCENT);
+        tft.fillRect(8, y, D_W - 16, 36, sel ? C_HEADER_BG : C_DARK_GRAY);
+        tft.drawRect(8, y, D_W - 16, 36, sel ? C_ACCENT : C_LIGHT_GRAY);
+        if (sel) tft.drawRect(9, y + 1, D_W - 18, 34, C_ACCENT);
 
         tft.setTextColor(sel ? C_ACCENT : C_LIGHT_GRAY);
         tft.setTextSize(2);
-        tft.setCursor(20, y + 11);
+        tft.setCursor(20, y + 10);
         tft.print(MENU_ITEMS[i]);
     }
 
@@ -402,6 +404,38 @@ static void render_local_cfg(const GameState_t *gs) {
     tft.print("CANCEL = back");
 }
 
+static void render_famous(const GameState_t *gs) {
+    tft.fillScreen(C_BG);
+    tft.fillRect(0, 0, D_W, HEADER_H, C_HEADER_BG);
+    tft.setTextColor(C_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(6, 6);
+    tft.print("Famous Games");
+
+    tft.setTextColor(C_DIM);
+    tft.setTextSize(1);
+    tft.setCursor(6, HEADER_H + 4);
+    tft.print("step through move by move");
+
+    for (int i = 0; i < FAMOUS_GAME_COUNT; i++) {
+        int  y   = 64 + i * 44;
+        bool sel = (i == gs->cfg_cursor);
+        tft.fillRect(8, y, D_W - 16, 36, sel ? C_HEADER_BG : C_DARK_GRAY);
+        tft.drawRect(8, y, D_W - 16, 36, sel ? C_ACCENT : C_LIGHT_GRAY);
+        tft.setTextColor(sel ? C_ACCENT : C_LIGHT_GRAY);
+        tft.setTextSize(2);
+        tft.setCursor(20, y + 10);
+        tft.print(FAMOUS_GAMES[i].name);
+    }
+
+    tft.setTextColor(C_DIM);
+    tft.setTextSize(1);
+    tft.setCursor(6, 292);
+    tft.print("UP/DN move  OK start");
+    tft.setCursor(6, 304);
+    tft.print("CANCEL = back");
+}
+
 // --- WiFi / token setup screen -----------------------------------------------
 //
 // static instructions shown while the captive portal is up. all the details are
@@ -551,7 +585,7 @@ static void redraw_promo_tiles(const GameState_t *gs) {
 // --- frame rendering ---------------------------------------------------------
 
 enum DispScreen {
-    SCR_NONE, SCR_MENU, SCR_ONLINE_CFG, SCR_BOT_CFG, SCR_LOCAL_CFG, SCR_SETUP,
+    SCR_NONE, SCR_MENU, SCR_ONLINE_CFG, SCR_BOT_CFG, SCR_LOCAL_CFG, SCR_FAMOUS, SCR_SETUP,
     SCR_NOTICE, SCR_CONFIRM, SCR_GAMEOVER, SCR_BOARD, SCR_MATCH, SCR_PROMO
 };
 
@@ -605,6 +639,7 @@ static void render_frame(const GameState_t *gs, DispState *st, bool got) {
     if (gs->ui_screen == UI_ONLINE_CFG) { render_online_cfg(gs); st->shown = SCR_ONLINE_CFG; return; }
     if (gs->ui_screen == UI_BOT_CFG)    { render_bot_cfg(gs);    st->shown = SCR_BOT_CFG;    return; }
     if (gs->ui_screen == UI_LOCAL_CFG)  { render_local_cfg(gs);  st->shown = SCR_LOCAL_CFG;  return; }
+    if (gs->ui_screen == UI_FAMOUS)     { render_famous(gs);     st->shown = SCR_FAMOUS;     return; }
 
     if (gs->promo_state == PROMO_SELECTING) {
         if (st->shown != SCR_PROMO)                      render_promo_picker(gs);

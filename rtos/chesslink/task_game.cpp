@@ -10,6 +10,8 @@ typedef enum {
     PHASE_PROMO_SELECT,   // pawn reached back rank, waiting for piece choice
     PHASE_OPP_SYNC,       // opponent moved online -- waiting for the player to
                           // replay that move on the physical board
+    PHASE_REPLAY,         // famous-game study -- waiting for the player to make the
+                          // scripted move on the physical board
     PHASE_GAME_OVER,      // game finished -- showing the result, any button = menu
 } MovePhase_t;
 
@@ -58,6 +60,20 @@ const TimePreset_t LOCAL_TIME_PRESETS[] = {
 const int LOCAL_TIME_COUNT = sizeof(LOCAL_TIME_PRESETS) / sizeof(LOCAL_TIME_PRESETS[0]);
 #define LOCAL_DEFAULT_TIME_IDX 0   // Untimed (preserves the old instant-start default)
 
+// --- famous games (step-through study mode) ----------------------------------
+// The Immortal Game -- Anderssen vs Kieseritzky, London 1851 -- in UCI.
+static const char *IMMORTAL_MOVES[] = {
+    "e2e4","e7e5","f2f4","e5f4","f1c4","d8h4","e1f1","b7b5","c4b5","g8f6",
+    "g1f3","h4h6","d2d3","f6h5","f3h4","h6g5","h4f5","c7c6","g2g4","h5f6",
+    "h1g1","c6b5","h2h4","g5g6","h4h5","g6g5","d1f3","f6g8","c1f4","g5f6",
+    "b1c3","f8c5","c3d5","f6b2","f4d6","c5g1","e4e5","b2a1","f1e2","b8a6",
+    "f5g7","e8d8","f3f6","g8f6","d6e7",
+};
+const FamousGame_t FAMOUS_GAMES[] = {
+    { "Immortal Game", IMMORTAL_MOVES, (int)(sizeof(IMMORTAL_MOVES)/sizeof(IMMORTAL_MOVES[0])) },
+};
+const int FAMOUS_GAME_COUNT = (int)(sizeof(FAMOUS_GAMES) / sizeof(FAMOUS_GAMES[0]));
+
 typedef struct {
     Position    pos;
     GameMode_t  mode;
@@ -71,8 +87,20 @@ typedef struct {
     bool        in_online_cfg; // online rated-match config submenu is showing
     bool        in_bot_cfg;    // play-computer config submenu is showing
     bool        in_local_cfg;  // local over-the-board clock config submenu is showing
+    bool        in_famous;     // famous-games list submenu is showing
     bool        confirm_exit;  // "leave game?" prompt is up
     uint8_t     menu_cursor;   // MENU_ITEM_*
+
+    // famous-game replay (study mode)
+    const char *const *replay_moves;  // UCI move list of the selected game
+    int         replay_count;         // number of moves
+    int         replay_idx;           // index of the move being made now
+    bool        replay_hints;         // show the next move on the LEDs
+    uint64_t    replay_pre_occ;       // board occupancy before the current move
+    uint64_t    replay_target;        // board occupancy after the current move
+    Move        replay_move;          // the current scripted move (applied on success)
+    uint8_t     replay_from;
+    uint8_t     replay_to;
 
     // config submenus
     uint8_t     cfg_cursor;    // CFG_ROW_* / BOT_ROW_*
@@ -167,6 +195,7 @@ static void publish_game_state(const GameCtx_t *ctx) {
                     : ctx->in_online_cfg               ? UI_ONLINE_CFG
                     : ctx->in_bot_cfg                  ? UI_BOT_CFG
                     : ctx->in_local_cfg                ? UI_LOCAL_CFG
+                    : ctx->in_famous                   ? UI_FAMOUS
                     : ctx->phase == PHASE_GAME_OVER    ? UI_GAMEOVER
                     : ctx->in_notice                   ? UI_NOTICE
                                                        : UI_GAME;
@@ -220,6 +249,7 @@ static void enter_menu(GameCtx_t *ctx) {
     ctx->in_online_cfg = false;
     ctx->in_bot_cfg    = false;
     ctx->in_local_cfg  = false;
+    ctx->in_famous     = false;
     ctx->mode    = GAME_MODE_IDLE;
     ctx->phase   = PHASE_IDLE;
     ctx->local_timed = false;
@@ -230,6 +260,10 @@ static void enter_menu(GameCtx_t *ctx) {
     publish_game_state(ctx);
 }
 
+// forward declarations (defined further down, needed by check_setup)
+static void end_game(GameCtx_t *ctx, const char *result);
+static void replay_present_move(GameCtx_t *ctx);
+
 // Adopt an authoritative position from the server (online play). The board always
 // defers to this: ctx->pos becomes the server's truth, and if the physical board
 // is behind, we guide the player to catch it up (PHASE_OPP_SYNC).
@@ -238,6 +272,7 @@ static void reconcile_to_server(GameCtx_t *ctx, const char *fen, bool have_last,
     Position sp;
     pos_from_fen(&sp, fen);
     ctx->pos = sp;                       // the server is authoritative, always
+    ctx->board_error = false;            // any prior disturbance is moot now
 
     if (have_last)
         snprintf(ctx->last_move, sizeof(ctx->last_move), "%c%c%c%c",
@@ -281,6 +316,12 @@ static void check_setup(GameCtx_t *ctx, uint64_t occ) {
             ctx->pending_sync = false;
             reconcile_to_server(ctx, ctx->pending_fen, ctx->pending_have_last,
                                 ctx->pending_from, ctx->pending_to);
+            return;
+        }
+
+        // famous-game study -- board is set, present the first scripted move
+        if (ctx->mode == GAME_MODE_REPLAY) {
+            replay_present_move(ctx);
             return;
         }
 
@@ -442,6 +483,87 @@ static void end_game(GameCtx_t *ctx, const char *result) {
     publish_game_state(ctx);
 }
 
+// --- famous-game study mode --------------------------------------------------
+
+// redraw the LEDs for the current replay step: the scripted move (if hints are
+// on) in blue/cyan, plus any squares the player has wrongly disturbed in red
+static void replay_render(GameCtx_t *ctx, uint64_t err) {
+    send_led_clear();
+    if (ctx->replay_hints) {
+        send_led_sq(ctx->replay_from, 0, 0, 200);     // source, blue
+        send_led_sq(ctx->replay_to,   0, 100, 255);   // destination, cyan
+    }
+    uint64_t e = err;
+    while (e) {
+        uint8_t sq = (uint8_t)__builtin_ctzll(e);
+        e &= e - 1;
+        send_led_sq(sq, 220, 0, 0);                    // wrong piece, red
+    }
+}
+
+// present the move at ctx->replay_idx: precompute the before/after occupancy and
+// wait (PHASE_REPLAY) for the player to make it on the board
+static void replay_present_move(GameCtx_t *ctx) {
+    if (ctx->replay_idx >= ctx->replay_count) {        // reached the end
+        end_game(ctx, "Game complete!");
+        return;
+    }
+
+    const char *uci = ctx->replay_moves[ctx->replay_idx];
+    Move m = uci_to_move(&ctx->pos, uci);
+    if (m == MOVE_NONE) { end_game(ctx, "replay data error"); return; }
+
+    ctx->replay_move    = m;
+    ctx->replay_pre_occ = ctx->pos.all;
+    ctx->replay_from    = (uint8_t)((uci[0] - 'a') + (uci[1] - '1') * 8);
+    ctx->replay_to      = (uint8_t)((uci[2] - 'a') + (uci[3] - '1') * 8);
+
+    // occupancy the board should reach once this move is played
+    Position after = ctx->pos, undo;
+    make_move_pos(&after, m, &undo);
+    ctx->replay_target = after.all;
+
+    ctx->phase = PHASE_REPLAY;
+    strncpy(ctx->last_move, uci, sizeof(ctx->last_move) - 1);
+    ctx->last_move[sizeof(ctx->last_move) - 1] = '\0';
+    snprintf(ctx->status_msg, sizeof(ctx->status_msg), "Move %d/%d   Hints:%s",
+             ctx->replay_idx + 1, ctx->replay_count, ctx->replay_hints ? "ON" : "OFF");
+    replay_render(ctx, 0);
+    publish_game_state(ctx);
+}
+
+// enter study mode for the chosen famous game -- run the normal board setup first
+static void start_replay(GameCtx_t *ctx, int game_idx) {
+    if (game_idx < 0 || game_idx >= FAMOUS_GAME_COUNT) return;
+    const FamousGame_t *g = &FAMOUS_GAMES[game_idx];
+
+    ctx->in_menu = ctx->in_notice = ctx->in_online_cfg = false;
+    ctx->in_bot_cfg = ctx->in_local_cfg = ctx->in_famous = false;
+    ctx->mode          = GAME_MODE_REPLAY;
+    ctx->phase         = PHASE_SETUP_BOARD;
+    ctx->local_timed   = false;
+    ctx->untimed       = true;             // never a clock screen in study mode
+    ctx->white_clock_ms = ctx->black_clock_ms = 0;
+    ctx->replay_moves  = g->moves;
+    ctx->replay_count  = g->count;
+    ctx->replay_idx    = 0;
+    ctx->replay_hints  = true;             // start with the move shown
+
+    pos_from_fen(&ctx->pos, STARTPOS_FEN);
+    strncpy(ctx->status_msg, "Set up the board", sizeof(ctx->status_msg) - 1);
+    send_led_clear();
+    publish_game_state(ctx);
+    check_setup(ctx, ctx->last_occupied);  // in case the board is already set up
+}
+
+// open the famous-games list submenu
+static void open_famous(GameCtx_t *ctx) {
+    ctx->in_menu   = false;
+    ctx->in_famous = true;
+    ctx->cfg_cursor = 0;                    // selected game index
+    publish_game_state(ctx);
+}
+
 // local end-of-game test after a move: no legal reply means mate or stalemate;
 // also the 50-move rule. online results come from lichess instead
 static bool check_local_end(GameCtx_t *ctx) {
@@ -570,6 +692,24 @@ static void process_board_change(GameCtx_t *ctx, const BoardState_t *bs) {
         return;
     }
 
+    // famous-game study: wait for the scripted move to be made on the board.
+    if (ctx->phase == PHASE_REPLAY) {
+        if (curr == ctx->replay_target) {
+            Position undo;
+            make_move_pos(&ctx->pos, ctx->replay_move, &undo);  // advance the truth
+            ctx->replay_idx++;
+            replay_present_move(ctx);                            // present the next move
+            return;
+        }
+        // the two squares of the scripted move may legitimately be in flux; any
+        // OTHER square that differs from the target holds a wrongly-placed piece
+        uint64_t move_sq = (ctx->replay_pre_occ ^ ctx->replay_target)
+                         | BB_SQ(ctx->replay_from) | BB_SQ(ctx->replay_to);
+        uint64_t err = (curr ^ ctx->replay_target) & ~move_sq;
+        replay_render(ctx, err);
+        return;
+    }
+
     if (ctx->phase == PHASE_IDLE) {
         uint64_t missing = prev & ~curr;   // truth says occupied, board is empty
         uint64_t extra   = curr & ~prev;   // board occupied, truth says empty
@@ -579,12 +719,32 @@ static void process_board_change(GameCtx_t *ctx, const BoardState_t *bs) {
             if (ctx->board_error) {
                 ctx->board_error = false;
                 send_led_clear();
-                snprintf(ctx->status_msg, sizeof(ctx->status_msg),
-                         ctx->mode == GAME_MODE_LOCAL
-                             ? (ctx->pos.side == WHITE ? "white to move" : "black to move")
-                             : "your move");
+                const char *msg =
+                    (ctx->mode == GAME_MODE_LOCAL)
+                        ? (ctx->pos.side == WHITE ? "white to move" : "black to move")
+                    : ((uint8_t)ctx->pos.side != ctx->my_color)
+                        ? "wait for opponent's move"
+                        : "your move";
+                strncpy(ctx->status_msg, msg, sizeof(ctx->status_msg) - 1);
+                ctx->status_msg[sizeof(ctx->status_msg) - 1] = '\0';
                 publish_game_state(ctx);
             }
+            return;
+        }
+
+        // ONLINE/BOT: while it's the opponent's turn (we've moved, the server
+        // hasn't sent their reply yet) it is NOT our move. Don't start a move --
+        // any piece the player disturbs is flagged red until the board is put back
+        // or the opponent's move arrives. This also keeps us in PHASE_IDLE so the
+        // incoming move still gets shown (a lifted piece would have hidden it).
+        if (ctx->mode == GAME_MODE_LICHESS && (uint8_t)ctx->pos.side != ctx->my_color) {
+            LedCmd_t cmd = { .type = LED_CMD_HILITE, .r = 200, .g = 0, .b = 0,
+                             .mask = missing | extra };
+            xQueueSend(xQ_LedCmd, &cmd, 0);
+            ctx->board_error = true;
+            snprintf(ctx->status_msg, sizeof(ctx->status_msg),
+                     "wait for opponent's move");
+            publish_game_state(ctx);
             return;
         }
 
@@ -743,6 +903,7 @@ static void handle_button(GameCtx_t *ctx, ButtonEvent_t evt) {
             case BTN_EVT_CONFIRM:
                 if      (ctx->menu_cursor == MENU_ITEM_ONLINE) open_online_cfg(ctx);
                 else if (ctx->menu_cursor == MENU_ITEM_BOT)    open_bot_cfg(ctx);
+                else if (ctx->menu_cursor == MENU_ITEM_FAMOUS) open_famous(ctx);
                 else if (ctx->menu_cursor == MENU_ITEM_SETUP)  open_setup(ctx);
                 else                                           open_local_cfg(ctx);
                 break;
@@ -824,6 +985,39 @@ static void handle_button(GameCtx_t *ctx, ButtonEvent_t evt) {
                 }
                 break;
             case BTN_EVT_CANCEL: enter_menu(ctx); break;
+        }
+        return;
+    }
+
+    // famous-games list: UP/DOWN pick a game, CONFIRM starts it, CANCEL backs out
+    if (ctx->in_famous) {
+        switch (evt) {
+            case BTN_EVT_UP:
+                ctx->cfg_cursor = (uint8_t)((ctx->cfg_cursor + FAMOUS_GAME_COUNT - 1) % FAMOUS_GAME_COUNT);
+                publish_game_state(ctx); break;
+            case BTN_EVT_DOWN:
+                ctx->cfg_cursor = (uint8_t)((ctx->cfg_cursor + 1) % FAMOUS_GAME_COUNT);
+                publish_game_state(ctx); break;
+            case BTN_EVT_CONFIRM: start_replay(ctx, ctx->cfg_cursor); break;
+            case BTN_EVT_CANCEL:  enter_menu(ctx); break;
+        }
+        return;
+    }
+
+    // famous-game study: CONFIRM toggles the on-board move hint, CANCEL leaves
+    if (ctx->phase == PHASE_REPLAY) {
+        if (evt == BTN_EVT_CANCEL) {
+            ctx->confirm_exit = true;
+            publish_game_state(ctx);
+        } else if (evt == BTN_EVT_CONFIRM) {
+            ctx->replay_hints = !ctx->replay_hints;
+            snprintf(ctx->status_msg, sizeof(ctx->status_msg), "Move %d/%d   Hints:%s",
+                     ctx->replay_idx + 1, ctx->replay_count, ctx->replay_hints ? "ON" : "OFF");
+            uint64_t move_sq = (ctx->replay_pre_occ ^ ctx->replay_target)
+                             | BB_SQ(ctx->replay_from) | BB_SQ(ctx->replay_to);
+            uint64_t err = (ctx->last_occupied ^ ctx->replay_target) & ~move_sq;
+            replay_render(ctx, err);
+            publish_game_state(ctx);
         }
         return;
     }
@@ -1008,7 +1202,9 @@ void task_GameLogic(void *pvParameters) {
         // the 20ms read timeout also paces this loop
         if (xQueueReceive(xQ_BoardState, &bs, pdMS_TO_TICKS(20)) == pdTRUE) {
             ctx.last_occupied = bs.occupied;
-            if (!ctx.in_menu) process_board_change(&ctx, &bs);
+            // only track pieces during an actual game/setup -- not in the menu or
+            // any submenu (all of which leave the mode at GAME_MODE_IDLE)
+            if (ctx.mode != GAME_MODE_IDLE) process_board_change(&ctx, &bs);
         }
 
         // network updates are handled in EVERY state (before the menu skip below)

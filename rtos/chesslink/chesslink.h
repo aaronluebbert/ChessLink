@@ -119,6 +119,7 @@ typedef enum {
     GAME_MODE_IDLE,       // sitting in the menu, no game running
     GAME_MODE_LOCAL,
     GAME_MODE_LICHESS,
+    GAME_MODE_REPLAY,     // stepping through a famous game move by move
 } GameMode_t;
 
 // top-level screen the display shows
@@ -127,6 +128,7 @@ typedef enum {
     UI_ONLINE_CFG, // online rated-match config submenu
     UI_BOT_CFG,    // play-computer (Stockfish) config submenu
     UI_LOCAL_CFG,  // local over-the-board config (clock) submenu
+    UI_FAMOUS,     // famous-games list submenu
     UI_GAME,       // in a game -- board / match / promo screens
     UI_SETUP,      // WiFi/token captive-portal instructions
     UI_NOTICE,     // transient status ("seeking...") -- no button prompt
@@ -135,11 +137,17 @@ typedef enum {
 } UiScreen_t;
 
 // mode-select menu items, in cursor order
-#define MENU_ITEM_COUNT  4
+#define MENU_ITEM_COUNT  5
 #define MENU_ITEM_LOCAL  0
 #define MENU_ITEM_ONLINE 1
 #define MENU_ITEM_BOT    2
-#define MENU_ITEM_SETUP  3
+#define MENU_ITEM_FAMOUS 3
+#define MENU_ITEM_SETUP  4
+
+// famous games (step-through study mode)
+typedef struct { const char *name; const char *const *moves; int count; } FamousGame_t;
+extern const FamousGame_t FAMOUS_GAMES[];
+extern const int          FAMOUS_GAME_COUNT;
 
 // time-control preset (min = 0 means untimed). two lists: the online rated one
 // (all timed) and the bot one (adds untimed)
