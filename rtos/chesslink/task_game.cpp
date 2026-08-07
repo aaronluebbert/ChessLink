@@ -46,6 +46,18 @@ const int BOT_TIME_COUNT = sizeof(BOT_TIME_PRESETS) / sizeof(BOT_TIME_PRESETS[0]
 #define BOT_DEFAULT_TIME_IDX 2   // 5+3
 #define BOT_DEFAULT_LEVEL    3
 
+// local over-the-board time controls -- untimed plus common OTB controls
+const TimePreset_t LOCAL_TIME_PRESETS[] = {
+    {  0,  0, "Untimed" },
+    {  3,  2, "3+2"     },
+    {  5,  3, "5+3"     },
+    { 10,  0, "10+0"    },
+    { 15, 10, "15+10"   },
+    { 30,  0, "30+0"    },
+};
+const int LOCAL_TIME_COUNT = sizeof(LOCAL_TIME_PRESETS) / sizeof(LOCAL_TIME_PRESETS[0]);
+#define LOCAL_DEFAULT_TIME_IDX 0   // Untimed (preserves the old instant-start default)
+
 typedef struct {
     Position    pos;
     GameMode_t  mode;
@@ -58,6 +70,7 @@ typedef struct {
     bool        in_notice;     // transient status notice (e.g. "seeking...")
     bool        in_online_cfg; // online rated-match config submenu is showing
     bool        in_bot_cfg;    // play-computer config submenu is showing
+    bool        in_local_cfg;  // local over-the-board clock config submenu is showing
     bool        confirm_exit;  // "leave game?" prompt is up
     uint8_t     menu_cursor;   // MENU_ITEM_*
 
@@ -68,9 +81,14 @@ typedef struct {
     uint8_t     cfg_level;     // bot 1..8
     uint8_t     cfg_color;     // bot 0=white 1=black 2=random
 
-    // clock data (from lichess, 0 if local game)
+    // clock data (from lichess, or run locally for a timed OTB game)
     uint32_t    white_clock_ms;
     uint32_t    black_clock_ms;
+    bool        local_timed;       // local game has clocks running
+    uint32_t    local_inc_ms;      // increment added after each local move
+    TickType_t  turn_start;        // tick the side-to-move's turn began (local clock)
+    bool        untimed;           // no time control -> never show clocks, even if
+                                   // the server still sends clock data
 
     // live-match players (filled from the lichess gameFull event via NetUpdate)
     char        my_name[20];
@@ -78,6 +96,14 @@ typedef struct {
     uint16_t    my_rating;
     uint16_t    opp_rating;
     uint8_t     my_color;      // 0=white 1=black
+
+    // authoritative server-sync (online): a full position from lichess that arrived
+    // while the board was still being set up, applied once setup completes
+    bool        pending_sync;
+    char        pending_fen[92];
+    bool        pending_have_last;
+    uint8_t     pending_from;
+    uint8_t     pending_to;
 
     // latest board occupancy from the sensors, cached even in the menu so the
     // start-position check can see a static (already set up) board right away
@@ -88,6 +114,15 @@ typedef struct {
     uint8_t     lifted_sq;
     uint8_t     promo_to_sq;   // destination square saved while picker is open
     BB          legal_dests;
+    // every square that has been physically empty since the move began (origin
+    // plus any captured square). used to disambiguate captures: two captures from
+    // the same origin leave identical occupancy, so we require the captured square
+    // to have actually been lifted before accepting that capture.
+    uint64_t    lifted_mask;
+    // true while red error squares are being shown for a board inconsistency
+    // (piece moved out of turn / dropped on the wrong square) so idle knows to
+    // clear them once the board is put right again.
+    bool        board_error;
 
     // candidate legal moves from lifted_sq + the occupancy each would leave.
     // a physical move is recognized when the sensors match one of these, which
@@ -114,7 +149,7 @@ static void send_led_sq(uint8_t sq, uint8_t r, uint8_t g, uint8_t b) {
 
 static void show_legal_moves(uint8_t from_sq, BB dests) {
     LedCmd_t cmd = {
-        .type = LED_CMD_PATTERN,
+        .type = LED_CMD_HILITE,          // only the legal squares lit, rest dark
         .square = from_sq,
         .r = 0, .g = 200, .b = 0,
         .mask = dests,
@@ -131,6 +166,7 @@ static void publish_game_state(const GameCtx_t *ctx) {
                     : ctx->in_menu                     ? UI_MENU
                     : ctx->in_online_cfg               ? UI_ONLINE_CFG
                     : ctx->in_bot_cfg                  ? UI_BOT_CFG
+                    : ctx->in_local_cfg                ? UI_LOCAL_CFG
                     : ctx->phase == PHASE_GAME_OVER    ? UI_GAMEOVER
                     : ctx->in_notice                   ? UI_NOTICE
                                                        : UI_GAME;
@@ -148,6 +184,21 @@ static void publish_game_state(const GameCtx_t *ctx) {
     strncpy(gs.status_msg, ctx->status_msg, sizeof(gs.status_msg) - 1);
     gs.white_clock_ms = ctx->white_clock_ms;
     gs.black_clock_ms = ctx->black_clock_ms;
+    if (ctx->untimed || ctx->phase == PHASE_SETUP_BOARD) {
+        // untimed game (or still setting up) -> never show a clock screen, even if
+        // lichess keeps sending clock data
+        gs.white_clock_ms = gs.black_clock_ms = 0;
+    } else if (ctx->local_timed &&
+        (ctx->phase == PHASE_IDLE || ctx->phase == PHASE_PIECE_LIFTED
+         || ctx->phase == PHASE_PROMO_SELECT)) {
+        // publish the side-to-move's LIVE remaining time so the display's own
+        // tick-down always starts from the accurate value
+        uint32_t elapsed = (xTaskGetTickCount() - ctx->turn_start) * portTICK_PERIOD_MS;
+        if (ctx->pos.side == WHITE)
+            gs.white_clock_ms = (ctx->white_clock_ms > elapsed) ? ctx->white_clock_ms - elapsed : 0;
+        else
+            gs.black_clock_ms = (ctx->black_clock_ms > elapsed) ? ctx->black_clock_ms - elapsed : 0;
+    }
     strncpy(gs.my_name,  ctx->my_name,  sizeof(gs.my_name)  - 1);
     strncpy(gs.opp_name, ctx->opp_name, sizeof(gs.opp_name) - 1);
     gs.my_rating  = ctx->my_rating;
@@ -168,11 +219,47 @@ static void enter_menu(GameCtx_t *ctx) {
     ctx->in_setup      = false;
     ctx->in_online_cfg = false;
     ctx->in_bot_cfg    = false;
+    ctx->in_local_cfg  = false;
     ctx->mode    = GAME_MODE_IDLE;
     ctx->phase   = PHASE_IDLE;
+    ctx->local_timed = false;
+    ctx->untimed     = false;
     ctx->white_clock_ms = ctx->black_clock_ms = 0;
     send_led_clear();
     strncpy(ctx->status_msg, "select a mode", sizeof(ctx->status_msg) - 1);
+    publish_game_state(ctx);
+}
+
+// Adopt an authoritative position from the server (online play). The board always
+// defers to this: ctx->pos becomes the server's truth, and if the physical board
+// is behind, we guide the player to catch it up (PHASE_OPP_SYNC).
+static void reconcile_to_server(GameCtx_t *ctx, const char *fen, bool have_last,
+                                uint8_t from, uint8_t to) {
+    Position sp;
+    pos_from_fen(&sp, fen);
+    ctx->pos = sp;                       // the server is authoritative, always
+
+    if (have_last)
+        snprintf(ctx->last_move, sizeof(ctx->last_move), "%c%c%c%c",
+                 'a' + (from & 7), '1' + (from >> 3),
+                 'a' + (to   & 7), '1' + (to   >> 3));
+
+    if (ctx->last_occupied == sp.all) {
+        // physical board already matches the server -> ready to play or wait
+        ctx->phase = PHASE_IDLE;
+        send_led_clear();
+        snprintf(ctx->status_msg, sizeof(ctx->status_msg),
+                 ((uint8_t)sp.side == ctx->my_color) ? "your move" : "opponent to move");
+    } else {
+        // board is behind the server -> make the shown move on the board
+        ctx->phase = PHASE_OPP_SYNC;
+        send_led_clear();
+        if (have_last) {
+            send_led_sq(from, 0, 0, 200);      // source, blue
+            send_led_sq(to,   0, 100, 255);    // destination, cyan
+        }
+        snprintf(ctx->status_msg, sizeof(ctx->status_msg), "play the move shown");
+    }
     publish_game_state(ctx);
 }
 
@@ -180,30 +267,83 @@ static void enter_menu(GameCtx_t *ctx) {
 // sensor reading; ctx->pos is the freshly-loaded start position, so pos.all is
 // the target occupancy (we haven't moved yet)
 static void check_setup(GameCtx_t *ctx, uint64_t occ) {
-    if (occ == ctx->pos.all) {
+    uint64_t missing = ctx->pos.all & ~occ;   // start square with no piece -> green
+    uint64_t extra   = occ & ~ctx->pos.all;   // a piece where none belongs -> red
+
+    if (missing == 0 && extra == 0) {         // board matches the start position
         ctx->phase = PHASE_IDLE;
+        ctx->turn_start = xTaskGetTickCount();   // white's clock starts now (if timed)
         send_led_clear();
+
+        // an online game may have advanced (opponent moved) while we were setting
+        // up -- reconcile to the server's position now that the board is ready
+        if (ctx->pending_sync) {
+            ctx->pending_sync = false;
+            reconcile_to_server(ctx, ctx->pending_fen, ctx->pending_have_last,
+                                ctx->pending_from, ctx->pending_to);
+            return;
+        }
+
         strncpy(ctx->status_msg,
                 ctx->mode == GAME_MODE_LOCAL ? "white to move" : "your move",
                 sizeof(ctx->status_msg) - 1);
         publish_game_state(ctx);
-    } else {
-        // light the squares that still need a piece placed on them
-        uint64_t missing = ctx->pos.all & ~occ;
-        LedCmd_t cmd = { .type = LED_CMD_HILITE, .r = 0, .g = 160, .b = 0, .mask = missing };
-        xQueueSend(xQ_LedCmd, &cmd, 0);
+        return;
     }
+
+    // Show what's blocking the start: green = still needs a piece, red = a piece
+    // sitting on a square that should be empty (misplaced piece or a stuck sensor).
+    LedCmd_t g = { .type = LED_CMD_HILITE, .r = 0, .g = 160, .b = 0, .mask = missing };
+    xQueueSend(xQ_LedCmd, &g, 0);
+    for (int sq = 0; sq < 64; sq++) {
+        if (extra & (1ULL << sq)) {
+            LedCmd_t rd = { .type = LED_CMD_SET_SQUARE, .square = (uint8_t)sq,
+                            .r = 160, .g = 0, .b = 0 };
+            xQueueSend(xQ_LedCmd, &rd, 0);
+        }
+    }
+    Serial.printf("[setup] occ=%016llX target=%016llX missing=%016llX extra=%016llX\n",
+                  (unsigned long long)occ,      (unsigned long long)ctx->pos.all,
+                  (unsigned long long)missing,  (unsigned long long)extra);
 }
 
-// start a local, over-the-board game
+// open the local over-the-board config submenu (clock control + start).
+// cfg_time_idx is shared between configs, so reset it to this mode's default
+static void open_local_cfg(GameCtx_t *ctx) {
+    ctx->in_menu      = false;
+    ctx->in_local_cfg = true;
+    ctx->cfg_cursor   = LOCAL_ROW_TIME;
+    ctx->cfg_time_idx = LOCAL_DEFAULT_TIME_IDX;
+    publish_game_state(ctx);
+}
+
+// start a local, over-the-board game using the selected time control
 static void start_local(GameCtx_t *ctx) {
+    const TimePreset_t *tp = &LOCAL_TIME_PRESETS[ctx->cfg_time_idx];
+
     ctx->in_menu       = false;
     ctx->in_notice     = false;
     ctx->in_online_cfg = false;
     ctx->in_bot_cfg    = false;
+    ctx->in_local_cfg  = false;
     ctx->mode    = GAME_MODE_LOCAL;
     ctx->phase   = PHASE_SETUP_BOARD;
-    ctx->white_clock_ms = ctx->black_clock_ms = 0;   // no clocks -> board screen
+
+    ctx->untimed = (tp->min == 0);
+    if (tp->min > 0) {                       // timed OTB game -> match/clock screen
+        ctx->local_timed    = true;
+        ctx->local_inc_ms   = (uint32_t)tp->inc * 1000;
+        ctx->white_clock_ms = ctx->black_clock_ms = (uint32_t)tp->min * 60000;
+        // label the two sides for the match screen (white at the bottom)
+        ctx->my_color = 0;
+        strncpy(ctx->my_name,  "White", sizeof(ctx->my_name)  - 1); ctx->my_name[sizeof(ctx->my_name)-1]  = '\0';
+        strncpy(ctx->opp_name, "Black", sizeof(ctx->opp_name) - 1); ctx->opp_name[sizeof(ctx->opp_name)-1] = '\0';
+        ctx->my_rating = ctx->opp_rating = 0;
+    } else {                                 // untimed -> plain board screen
+        ctx->local_timed    = false;
+        ctx->white_clock_ms = ctx->black_clock_ms = 0;
+    }
+
     pos_from_fen(&ctx->pos, STARTPOS_FEN);
     strncpy(ctx->status_msg, "Set up the board", sizeof(ctx->status_msg) - 1);
     send_led_clear();
@@ -239,6 +379,7 @@ static void start_lichess_game(GameCtx_t *ctx, const NetCmdMsg_t *cmd, const cha
     ctx->in_notice     = true;
     ctx->mode    = GAME_MODE_LICHESS;
     ctx->phase   = PHASE_IDLE;
+    ctx->pending_sync = false;
     pos_from_fen(&ctx->pos, STARTPOS_FEN);
     strncpy(ctx->status_msg, notice, sizeof(ctx->status_msg) - 1);
     send_led_clear();
@@ -249,6 +390,7 @@ static void start_lichess_game(GameCtx_t *ctx, const NetCmdMsg_t *cmd, const cha
 // start an online human game with the selected time control
 static void start_online(GameCtx_t *ctx) {
     const TimePreset_t *tp = &ONLINE_TIME_PRESETS[ctx->cfg_time_idx];
+    ctx->untimed = (tp->min == 0);
     NetCmdMsg_t cmd = { .type = NET_CMD_START_ONLINE, .time_min = tp->min,
                         .inc_sec = tp->inc, .rated = ctx->cfg_rated };
     start_lichess_game(ctx, &cmd, "Seeking opponent...");
@@ -257,6 +399,7 @@ static void start_online(GameCtx_t *ctx) {
 // start a game against Stockfish at the selected level/time/color
 static void start_bot(GameCtx_t *ctx) {
     const TimePreset_t *tp = &BOT_TIME_PRESETS[ctx->cfg_time_idx];
+    ctx->untimed = (tp->min == 0);   // "Untimed" -> hide clocks even if lichess sends them
     NetCmdMsg_t cmd = { .type = NET_CMD_START_BOT, .time_min = tp->min,
                         .inc_sec = tp->inc, .level = ctx->cfg_level, .color = ctx->cfg_color };
     start_lichess_game(ctx, &cmd, "Starting bot game...");
@@ -323,6 +466,17 @@ static void commit_move(GameCtx_t *ctx, Move chosen) {
     char uci[6];
     move_to_uci(chosen, uci);
 
+    // local clock: charge the mover for their think time, add the increment, then
+    // hand the clock to the other side (make_move_pos flips ctx->pos.side below)
+    if (ctx->local_timed) {
+        Color    mover   = ctx->pos.side;
+        uint32_t elapsed = (xTaskGetTickCount() - ctx->turn_start) * portTICK_PERIOD_MS;
+        uint32_t *clk    = (mover == WHITE) ? &ctx->white_clock_ms : &ctx->black_clock_ms;
+        *clk = (*clk > elapsed) ? (*clk - elapsed) : 0;
+        if (*clk > 0) *clk += ctx->local_inc_ms;
+        ctx->turn_start = xTaskGetTickCount();
+    }
+
     Position undo;
     make_move_pos(&ctx->pos, chosen, &undo);
 
@@ -369,6 +523,7 @@ static uint64_t occ_after_move(const Position *pos, Move m) {
 // a piece of the side to move left `from` -- gather its legal moves and the
 // occupancy each would produce, then wait for the board to match one
 static void begin_move(GameCtx_t *ctx, uint8_t from) {
+    ctx->board_error = false;        // a real move is starting -- drop any error hint
     ctx->lifted_sq   = from;
     ctx->legal_dests = legal_destinations(&ctx->pos, from);
 
@@ -416,26 +571,70 @@ static void process_board_change(GameCtx_t *ctx, const BoardState_t *bs) {
     }
 
     if (ctx->phase == PHASE_IDLE) {
-        // a move starts when a piece of the side to move leaves its square.
-        // (an opponent piece lifted first during a capture is ignored until
-        // the mover's own piece comes up)
-        uint64_t lifted = prev & ~curr;
-        while (lifted) {
-            uint8_t sq = (uint8_t)__builtin_ctzll(lifted);
-            lifted &= lifted - 1;
+        uint64_t missing = prev & ~curr;   // truth says occupied, board is empty
+        uint64_t extra   = curr & ~prev;   // board occupied, truth says empty
+
+        // board matches the game again -> clear any lingering error indicator
+        if (missing == 0 && extra == 0) {
+            if (ctx->board_error) {
+                ctx->board_error = false;
+                send_led_clear();
+                snprintf(ctx->status_msg, sizeof(ctx->status_msg),
+                         ctx->mode == GAME_MODE_LOCAL
+                             ? (ctx->pos.side == WHITE ? "white to move" : "black to move")
+                             : "your move");
+                publish_game_state(ctx);
+            }
+            return;
+        }
+
+        // a move starts when a piece of the side to move is lifted. (an opponent
+        // piece lifted first during a capture is fine -- ignored here until the
+        // mover's own piece comes up.)
+        uint64_t t = missing;
+        while (t) {
+            uint8_t sq = (uint8_t)__builtin_ctzll(t);
+            t &= t - 1;
             if (ctx->pos.color_at[sq] == ctx->pos.side) {
+                ctx->lifted_mask = missing;   // origin (+ any enemy already lifted)
                 begin_move(ctx, sq);
                 return;
             }
+        }
+
+        // no piece of the side to move has been lifted, yet something is out of
+        // place. if a piece has been set down somewhere (extra), the board is
+        // inconsistent -- a piece was moved out of turn, or dropped on the wrong
+        // square. light where it wrongly sits AND where it should go back, in red.
+        // (if only opponent pieces are lifted with nothing placed, stay quiet --
+        // that's the captured piece being removed ahead of a capture.)
+        if (extra) {
+            LedCmd_t cmd = { .type = LED_CMD_HILITE, .r = 200, .g = 0, .b = 0,
+                             .mask = missing | extra };
+            xQueueSend(xQ_LedCmd, &cmd, 0);
+            ctx->board_error = true;
+            snprintf(ctx->status_msg, sizeof(ctx->status_msg),
+                     "not your turn - put the red piece back");
+            publish_game_state(ctx);
         }
         return;
     }
 
     // PHASE_PIECE_LIFTED -- has the board settled onto a legal move's result?
+    ctx->lifted_mask |= (prev & ~curr);   // remember every square lifted so far
+
     for (int i = 0; i < ctx->cand_count; i++) {
         if (curr != ctx->cand_occ[i]) continue;
 
         Move m = ctx->cand_moves[i];
+        // A capture leaves the same occupancy as any other capture from this
+        // origin, so occupancy alone can't tell them apart -- and an illegal
+        // capture (e.g. one that leaves the king in check) can collide with a
+        // legal one and commit the wrong move. Require the captured square to
+        // have physically been lifted before accepting a capture.
+        if ((ctx->pos.all & BB_SQ(MV_TO(m))) && !(ctx->lifted_mask & BB_SQ(MV_TO(m))))
+            continue;
+
         if (MV_IS_PROMO(m)) {
             // Q/R/B/N all leave the same occupancy -- ask which piece
             ctx->promo_to_sq  = MV_TO(m);
@@ -457,18 +656,31 @@ static void process_board_change(GameCtx_t *ctx, const BoardState_t *bs) {
         return;
     }
 
-    // a single own piece dropped on a non-legal square -- flag it and re-hint.
-    // multi-step moves (captures, castling) pass through here mid-way with an
-    // empty `placed` and are simply left to complete
-    uint64_t lifted = prev & ~curr;
-    uint64_t placed = curr & ~prev;
-    if (placed && (placed & (placed - 1)) == 0
-        && lifted == BB_SQ(ctx->lifted_sq)) {
-        uint8_t to_sq = (uint8_t)__builtin_ctzll(placed);
-        if (!(ctx->legal_dests & BB_SQ(to_sq))) {
-            send_led_sq(to_sq, 255, 0, 0);
-            vTaskDelay(pdMS_TO_TICKS(300));
-            show_legal_moves(ctx->lifted_sq, ctx->legal_dests);
+    // Any piece now sitting on a square that isn't a legal destination of the
+    // lifted piece is a problem: either the mover was dropped on an illegal
+    // square, or a stray piece is out of place and blocking the move. Redraw the
+    // legal targets (green) + source (yellow) and mark every offending square red
+    // so the player can see exactly what to fix. Multi-step moves (captures,
+    // castling, en passant) pass through here mid-way with nothing newly placed
+    // (placed == 0) and are simply left to complete.
+    uint64_t missing = prev & ~curr;
+    uint64_t placed  = curr & ~prev;
+    // squares that don't belong to the move in progress get flagged red:
+    //  - placed pieces on a non-legal square (the wrong-colour piece's TO, or the
+    //    mover dropped somewhere illegal), and
+    //  - lifted pieces that are neither the mover's own piece nor a legal target
+    //    (the wrong-colour piece's FROM).
+    // a real capture's target square is a legal destination, so it's excluded and
+    // never flags -- the captured square just goes quietly empty then filled.
+    uint64_t bad = (placed  &  ~ctx->legal_dests)
+                 | (missing &  ~ctx->legal_dests & ~BB_SQ(ctx->lifted_sq));
+    if (bad) {
+        show_legal_moves(ctx->lifted_sq, ctx->legal_dests);   // green targets + yellow source
+        uint64_t b = bad;
+        while (b) {
+            uint8_t sq = (uint8_t)__builtin_ctzll(b);
+            b &= b - 1;
+            send_led_sq(sq, 220, 0, 0);                        // red: doesn't belong here
         }
     }
 }
@@ -532,7 +744,7 @@ static void handle_button(GameCtx_t *ctx, ButtonEvent_t evt) {
                 if      (ctx->menu_cursor == MENU_ITEM_ONLINE) open_online_cfg(ctx);
                 else if (ctx->menu_cursor == MENU_ITEM_BOT)    open_bot_cfg(ctx);
                 else if (ctx->menu_cursor == MENU_ITEM_SETUP)  open_setup(ctx);
-                else                                           start_local(ctx);
+                else                                           open_local_cfg(ctx);
                 break;
             case BTN_EVT_CANCEL: break;   // nothing above the top menu
         }
@@ -594,6 +806,28 @@ static void handle_button(GameCtx_t *ctx, ButtonEvent_t evt) {
         return;
     }
 
+    // local over-the-board config: Time row + Start
+    if (ctx->in_local_cfg) {
+        switch (evt) {
+            case BTN_EVT_UP:
+                ctx->cfg_cursor = (ctx->cfg_cursor + LOCAL_ROW_COUNT - 1) % LOCAL_ROW_COUNT;
+                publish_game_state(ctx); break;
+            case BTN_EVT_DOWN:
+                ctx->cfg_cursor = (ctx->cfg_cursor + 1) % LOCAL_ROW_COUNT;
+                publish_game_state(ctx); break;
+            case BTN_EVT_CONFIRM:
+                if (ctx->cfg_cursor == LOCAL_ROW_TIME) {
+                    ctx->cfg_time_idx = (ctx->cfg_time_idx + 1) % LOCAL_TIME_COUNT;
+                    publish_game_state(ctx);
+                } else {
+                    start_local(ctx);   // LOCAL_ROW_START
+                }
+                break;
+            case BTN_EVT_CANCEL: enter_menu(ctx); break;
+        }
+        return;
+    }
+
     // promotion picker
     if (ctx->phase == PHASE_PROMO_SELECT) {
         switch (evt) {
@@ -643,6 +877,26 @@ static void apply_opponent_move(GameCtx_t *ctx, const MoveEvent_t *mv) {
     publish_game_state(ctx);
 }
 
+// authoritative full-position sync from the server (online play only)
+static void apply_server_state(GameCtx_t *ctx, const NetUpdate_t *u) {
+    // still placing the pieces at the start position -- stash the server's state
+    // and reconcile the moment setup completes (see check_setup)
+    if (ctx->phase == PHASE_SETUP_BOARD) {
+        ctx->pending_sync = true;
+        strncpy(ctx->pending_fen, u->sync_fen, sizeof(ctx->pending_fen) - 1);
+        ctx->pending_fen[sizeof(ctx->pending_fen) - 1] = '\0';
+        ctx->pending_have_last = u->sync_have_last;
+        ctx->pending_from      = u->sync_from;
+        ctx->pending_to        = u->sync_to;
+        return;
+    }
+    // don't yank the truth out from under a move in progress; lichess resends the
+    // full state, so we'll reconcile on the next packet
+    if (ctx->phase == PHASE_PIECE_LIFTED || ctx->phase == PHASE_PROMO_SELECT)
+        return;
+    reconcile_to_server(ctx, u->sync_fen, u->sync_have_last, u->sync_from, u->sync_to);
+}
+
 // --- network status update ---------------------------------------------------
 //
 // clocks and player identities come from the network task, not the board.
@@ -657,11 +911,19 @@ static void apply_net_update(GameCtx_t *ctx, const NetUpdate_t *u) {
 
     if (u->has_status) {
         if (u->status == NET_STATUS_SETUP) {
-            ctx->in_setup = true;             // portal up -- show instructions
+            ctx->in_setup  = true;            // portal up -- show instructions
+            ctx->in_notice = false;
             publish_game_state(ctx);
-        } else if (u->status == NET_STATUS_ONLINE && ctx->in_setup) {
-            ctx->in_setup = false;            // connected -- back to the menu
-            enter_menu(ctx);
+        } else if (u->status == NET_STATUS_CONNECTING) {
+            ctx->in_setup  = false;           // creds submitted -- joining WiFi
+            ctx->in_notice = true;
+            strncpy(ctx->status_msg, "Connecting to WiFi...", sizeof(ctx->status_msg) - 1);
+            publish_game_state(ctx);
+        } else if (u->status == NET_STATUS_ONLINE) {
+            if (ctx->in_setup || ctx->in_notice) {
+                ctx->in_setup = false;        // connected -- back to the menu
+                enter_menu(ctx);              // also clears in_notice
+            }
         }
         return;
     }
@@ -688,7 +950,28 @@ static void apply_net_update(GameCtx_t *ctx, const NetUpdate_t *u) {
         ctx->white_clock_ms = u->white_clock_ms;
         ctx->black_clock_ms = u->black_clock_ms;
     }
+
+    // authoritative position from the server -- the board defers to it every time
+    if (u->has_sync) {
+        apply_server_state(ctx, u);
+        return;
+    }
+
     publish_game_state(ctx);
+}
+
+// local timed game: end the game the moment the side to move runs out of time
+static void check_local_flag(GameCtx_t *ctx) {
+    if (!ctx->local_timed) return;
+    if (ctx->phase != PHASE_IDLE && ctx->phase != PHASE_PIECE_LIFTED
+        && ctx->phase != PHASE_PROMO_SELECT) return;
+    uint32_t clk     = (ctx->pos.side == WHITE) ? ctx->white_clock_ms : ctx->black_clock_ms;
+    uint32_t elapsed = (xTaskGetTickCount() - ctx->turn_start) * portTICK_PERIOD_MS;
+    if (elapsed >= clk) {
+        if (ctx->pos.side == WHITE) ctx->white_clock_ms = 0; else ctx->black_clock_ms = 0;
+        ctx->local_timed = false;   // stop the clock
+        end_game(ctx, ctx->pos.side == WHITE ? "Black wins: time" : "White wins: time");
+    }
 }
 
 // --- task --------------------------------------------------------------------
@@ -728,6 +1011,14 @@ void task_GameLogic(void *pvParameters) {
             if (!ctx.in_menu) process_board_change(&ctx, &bs);
         }
 
+        // network updates are handled in EVERY state (before the menu skip below)
+        // so a setup/connected/error status can update the screen -- e.g. clear
+        // the WiFi-setup screen once the board connects, or in-game clocks/results
+        if (xQueueReceive(xQ_NetUpdate, &net_upd, 0) == pdTRUE)
+            apply_net_update(&ctx, &net_upd);
+
+        check_local_flag(&ctx);   // end a local timed game on flag-fall
+
         if (ctx.in_menu) continue;
 
         // only take an opponent move when idle and not mid-prompt -- otherwise
@@ -735,10 +1026,6 @@ void task_GameLogic(void *pvParameters) {
         if (ctx.phase == PHASE_IDLE && !ctx.confirm_exit
             && xQueueReceive(xQ_OpponentMove, &opp_mv, 0) == pdTRUE)
             apply_opponent_move(&ctx, &opp_mv);
-
-        // clocks + player names/ratings from the lichess stream
-        if (xQueueReceive(xQ_NetUpdate, &net_upd, 0) == pdTRUE)
-            apply_net_update(&ctx, &net_upd);
     }
 
     vTaskDelete(NULL);

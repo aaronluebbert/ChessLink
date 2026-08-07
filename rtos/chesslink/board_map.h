@@ -1,13 +1,9 @@
-// board_map.h -- physical wiring maps, pure and host-testable
+// board_map.h -- physical wiring map for the LED chain, pure and host-testable
 //
 // canonical square: sq = rank*8 + file, a1=0 .. h8=63 (file 0=a..7=h, rank 0..7)
 //
-// both maps below come from the validated single-chain detection sketch
-//
-// sensor read (one 64-bit HC165 daisy chain on SR_MISO, bit-banged):
-//   bits clock out in canonical order a1,b1..h1, a2..h2, ... a8..h8
-//   so read-index i maps straight to square i, no math needed
-//   A3144 is active-low, a LOW bit means a piece is on the square
+// (the sensor read map is the identity -- the HC165 chain clocks out in canonical
+// order a1,b1..h8 -- and lives inline in task_sensor.cpp's sr_read_all)
 //
 // LED chain (WS2812B DOUT from the ESP):
 //   LED 0 = h8, data runs right to left across each rank (h..a), then drops
@@ -21,13 +17,6 @@
 static inline int cl_led_index(int sq) {
     int file = sq & 7, rank = sq >> 3;
     return (7 - rank) * 8 + (7 - file);
-}
-
-// read-index in the shift-register bitstream -> canonical square
-// the chain clocks out in canonical order, so this is the identity map
-// (read-index 0 = first bit clocked out = a1 = sq 0)
-static inline int cl_sensor_sq(int readidx) {
-    return readidx;
 }
 
 #endif

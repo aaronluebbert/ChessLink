@@ -1,9 +1,13 @@
 #include "chesslink.h"
+#include "chess_engine.h"   // rebuild the authoritative position from the move list
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+
+static const char *LICHESS_START_FEN =
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
 // --- config ------------------------------------------------------------------
 // WiFi SSID/password and the lichess token all live in NVS namespace "wifi"
@@ -241,20 +245,10 @@ static bool lichess_resign(const char *gid) {
 
 // --- move color tracking -----------------------------------------------------
 //
-// lichess streams the full moves list on every gameState event.
-// we count how many moves have been played -- even count means white just moved,
-// odd means black just moved. combined with we_are_white we know if it's ours.
-//
-// we only forward moves to game logic when it's the OPPONENT who just moved.
-// this prevents the board from trying to re-apply our own move.
-
-static int count_moves(const char *moves_str) {
-    if (!moves_str || !strlen(moves_str)) return 0;
-    int count = 1;
-    for (const char *p = moves_str; *p; p++)
-        if (*p == ' ') count++;
-    return count;
-}
+// lichess streams the FULL moves list on every gameState event. Rather than
+// track moves incrementally (which drifts if a packet is missed or a move is
+// rejected), we rebuild the whole position from that list every time and hand it
+// to the game task as an authoritative truth-sync. The board always defers to it.
 
 // --- stream line handler -----------------------------------------------------
 
@@ -343,38 +337,42 @@ static void handle_stream_line(const char *line) {
 
         Serial.printf("[net] clock -- w:%lums b:%lums\n", s_white_clock_ms, s_black_clock_ms);
 
-        const char *moves = doc["moves"];
-        if (!moves || !strlen(moves)) return;
+        // Rebuild the authoritative position from the server's full move list and
+        // push it to the game task as a truth-sync (works for our own moves and
+        // the opponent's alike -- the board just adopts whatever the server says).
+        const char *moves = doc["moves"] | "";
 
-        int n = count_moves(moves);
-        // after n moves: if n is odd, white just moved; if even, black just moved
-        // (move 1 = white, move 2 = black, ...)
-        bool white_just_moved = (n % 2 == 1);
-        bool opponent_just_moved = (we_are_white) ? !white_just_moved : white_just_moved;
-
-        if (!opponent_just_moved) {
-            // our own move echoed back -- don't re-apply it, but re-sync clocks
-            // so the running clock snaps to the server's authoritative time
-            NetUpdate_t up = {};
-            up.has_clocks     = true;
-            up.white_clock_ms = s_white_clock_ms;
-            up.black_clock_ms = s_black_clock_ms;
-            xQueueSend(xQ_NetUpdate, &up, 0);
-            return;
+        Position sp;
+        pos_from_fen(&sp, LICHESS_START_FEN);
+        uint8_t last_from = 0, last_to = 0;
+        bool    have_last = false;
+        if (strlen(moves)) {
+            char buf[640];
+            strncpy(buf, moves, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            char *save = nullptr;
+            for (char *tok = strtok_r(buf, " ", &save); tok; tok = strtok_r(nullptr, " ", &save)) {
+                if (strlen(tok) < 4) continue;
+                Move m = uci_to_move(&sp, tok);
+                if (m == MOVE_NONE) break;          // stop replaying rather than corrupt
+                Position undo;
+                make_move_pos(&sp, m, &undo);
+                last_from = (uint8_t)((tok[0] - 'a') + (tok[1] - '1') * 8);
+                last_to   = (uint8_t)((tok[2] - 'a') + (tok[3] - '1') * 8);
+                have_last = true;
+            }
         }
 
-        // extract the last UCI token
-        const char *last = strrchr(moves, ' ');
-        const char *uci  = last ? last + 1 : moves;
-        if (strlen(uci) < 4) return;
-
-        MoveEvent_t opp = {};
-        strncpy(opp.uci, uci, sizeof(opp.uci) - 1);
-        opp.from_sq        = (uint8_t)((opp.uci[0] - 'a') + (opp.uci[1] - '1') * 8);
-        opp.to_sq          = (uint8_t)((opp.uci[2] - 'a') + (opp.uci[3] - '1') * 8);
-        opp.white_clock_ms = s_white_clock_ms;
-        opp.black_clock_ms = s_black_clock_ms;
-        xQueueSend(xQ_OpponentMove, &opp, 0);
+        NetUpdate_t up = {};
+        up.has_sync = true;
+        pos_to_fen(&sp, up.sync_fen, sizeof(up.sync_fen));
+        up.sync_have_last = have_last;
+        up.sync_from      = last_from;
+        up.sync_to        = last_to;
+        up.has_clocks     = true;
+        up.white_clock_ms = s_white_clock_ms;
+        up.black_clock_ms = s_black_clock_ms;
+        xQueueSend(xQ_NetUpdate, &up, 0);
         return;
     }
 
@@ -655,8 +653,9 @@ void task_Network(void *pvParameters) {
                 }
 
             } else if (cmd.type == NET_CMD_OPEN_SETUP) {
-                run_setup_portal();
-                ensure_connected();
+                run_setup_portal();                 // shows setup screen, user submits
+                net_report(NET_STATUS_CONNECTING);  // feedback while we join WiFi
+                ensure_connected();                 // -> ONLINE (menu), or reopens the portal
                 net_state = NET_STATE_IDLE;
             }
         }

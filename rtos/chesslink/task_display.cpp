@@ -1,12 +1,19 @@
 #include "chesslink.h"
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
-#include <SPI.h>
+#include <Arduino_GFX_Library.h>
 
 // --- display setup -----------------------------------------------------------
+//
+// ideaspark 1.9" 170x320 ST7789 (IPS) over VSPI. Arduino_GFX takes the panel
+// geometry explicitly -- the visible 170-wide area is offset by 35 columns in
+// the controller. `tft` is a reference to a heap object so the render code below
+// can keep using `tft.` calls unchanged (Adafruit-GFX-compatible API).
+static Arduino_DataBus *bus =
+    new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCLK, LCD_MOSI, GFX_NOT_DEFINED /*MISO*/);
+static Arduino_GFX &tft =
+    *(new Arduino_ST7789(bus, LCD_RST, 2 /*rotation: 180, USB-C at top*/, true /*IPS*/, 170, 320, 35, 0, 35, 0));
 
-static SPIClass hspi(HSPI);
-static Adafruit_ST7789 tft = Adafruit_ST7789(&hspi, LCD_CS, LCD_DC, LCD_RST);
+#define LCD_LOCK()   xSemaphoreTake(xSPI18Mutex, portMAX_DELAY)
+#define LCD_UNLOCK() xSemaphoreGive(xSPI18Mutex)
 
 #define D_W  170
 #define D_H  320
@@ -53,72 +60,6 @@ static Adafruit_ST7789 tft = Adafruit_ST7789(&hspi, LCD_CS, LCD_DC, LCD_RST);
 #define BOARD_X     ((D_W - BOARD_PX) / 2)
 #define BOARD_Y     84
 
-// --- FEN board parser --------------------------------------------------------
-//
-// parses the piece-placement section of a FEN string into a 64-byte array
-// where each entry is a piece char ('P','n','K', etc.) or 0 for empty.
-// used by draw_mini_board to render the right piece on each square.
-
-static void fen_to_squares(const char *fen, char *squares) {
-    memset(squares, 0, 64);
-    int rank = 7, file = 0;
-    for (const char *p = fen; *p && *p != ' '; p++) {
-        char c = *p;
-        if (c == '/') { rank--; file = 0; }
-        else if (c >= '1' && c <= '8') { file += c - '0'; }
-        else {
-            if (file < 8 && rank >= 0)
-                squares[rank * 8 + file] = c;
-            file++;
-        }
-    }
-}
-
-// --- board drawing -----------------------------------------------------------
-
-// draw one square at pixel coords (px, py) with the given piece char (0 = empty)
-// white pieces = uppercase, black pieces = lowercase
-static void draw_board_square(int px, int py, bool light_sq, char piece) {
-    uint16_t sq_color = light_sq ? C_SQ_LIGHT : C_SQ_DARK;
-    tft.fillRect(px, py, BOARD_SQ, BOARD_SQ, sq_color);
-
-    if (!piece) return;
-
-    bool is_white = (piece >= 'A' && piece <= 'Z');
-    char upper    = (piece >= 'a') ? piece - 32 : piece;
-
-    // draw piece circle -- white pieces: white fill, dark outline
-    //                       black pieces: dark fill, white outline
-    uint16_t fill    = is_white ? C_WHITE     : 0x2945;
-    uint16_t outline = is_white ? C_DARK_GRAY : C_WHITE;
-    int cx = px + BOARD_SQ / 2;
-    int cy = py + BOARD_SQ / 2;
-    tft.fillCircle(cx, cy, BOARD_SQ / 2 - 2, fill);
-    tft.drawCircle(cx, cy, BOARD_SQ / 2 - 2, outline);
-
-    // letter inside circle -- identifies piece type
-    // setTextSize(1) gives 6x8px characters, center them in the circle
-    tft.setTextSize(1);
-    tft.setTextColor(is_white ? C_BLACK : C_WHITE);
-    tft.setCursor(cx - 3, cy - 4);
-    tft.print(upper);
-}
-
-static void draw_mini_board(const char *fen) {
-    char squares[64];
-    fen_to_squares(fen, squares);
-
-    for (int row = 0; row < 8; row++) {
-        for (int col = 0; col < 8; col++) {
-            int px = BOARD_X + col * BOARD_SQ;
-            int py = BOARD_Y + (7 - row) * BOARD_SQ;  // rank 1 at bottom
-            draw_board_square(px, py, (row + col) % 2 == 0,
-                              squares[row * 8 + col]);
-        }
-    }
-    tft.drawRect(BOARD_X - 1, BOARD_Y - 1, BOARD_PX + 2, BOARD_PX + 2, C_LIGHT_GRAY);
-}
-
 // --- game screen draw functions ----------------------------------------------
 
 static void draw_header(GameMode_t mode) {
@@ -140,18 +81,6 @@ static void draw_header(GameMode_t mode) {
     tft.setTextSize(1);
     tft.setCursor(D_W - 52, 10);
     tft.print(label);
-}
-
-static void draw_turn_indicator(uint8_t active_color) {
-    uint16_t bg = active_color == 0 ? C_WHITE : C_BLACK;
-    uint16_t fg = active_color == 0 ? C_BLACK : C_WHITE;
-    tft.fillRect(0, TURN_Y, D_W, TURN_H, bg);
-    if (active_color == 1)
-        tft.drawRect(0, TURN_Y, D_W, TURN_H, C_LIGHT_GRAY);
-    tft.setTextColor(fg);
-    tft.setTextSize(1);
-    tft.setCursor(34, TURN_Y + 6);
-    tft.print(active_color == 0 ? "WHITE to move" : "BLACK to move");
 }
 
 static void draw_last_move(const char *move_str) {
@@ -176,10 +105,25 @@ static void draw_status(const char *msg) {
 static void render_game_state(const GameState_t *gs) {
     tft.fillScreen(C_BG);
     draw_header(gs->mode);
-    draw_turn_indicator(gs->active_color);
     draw_last_move(gs->last_move);
     draw_status(gs->status_msg);
-    draw_mini_board(gs->fen);
+
+    // No on-screen board -- the physical board is the board. Just show a big,
+    // clear "whose move" prompt where the mini board used to be.
+    const char *side = (gs->active_color == 0) ? "WHITE" : "BLACK";
+    uint16_t    col  = (gs->active_color == 0) ? C_WHITE : C_ACCENT;
+    int w = (int)strlen(side) * 6 * 4;
+    tft.setTextSize(4);
+    tft.setTextColor(col);
+    tft.setCursor((D_W - w) / 2, 150);
+    tft.print(side);
+
+    const char *sub = "to move";
+    int w2 = (int)strlen(sub) * 6 * 2;
+    tft.setTextSize(2);
+    tft.setTextColor(C_LIGHT_GRAY);
+    tft.setCursor((D_W - w2) / 2, 196);
+    tft.print(sub);
 }
 
 // --- live match screen -------------------------------------------------------
@@ -413,6 +357,51 @@ static void render_bot_cfg(const GameState_t *gs) {
     tft.print("CANCEL = back");
 }
 
+static void render_local_cfg(const GameState_t *gs) {
+    tft.fillScreen(C_BG);
+    tft.fillRect(0, 0, D_W, HEADER_H, C_HEADER_BG);
+    tft.setTextColor(C_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(6, 6);
+    tft.print("Local Game");
+
+    tft.setTextColor(C_DIM);
+    tft.setTextSize(1);
+    tft.setCursor(6, HEADER_H + 4);
+    tft.print("over-the-board setup");
+
+    for (int i = 0; i < LOCAL_ROW_COUNT; i++) {
+        int  y   = 60 + i * 42;
+        bool sel = (i == gs->cfg_cursor);
+
+        tft.fillRect(8, y, D_W - 16, 34, sel ? C_HEADER_BG : C_DARK_GRAY);
+        tft.drawRect(8, y, D_W - 16, 34, sel ? C_ACCENT : C_LIGHT_GRAY);
+
+        tft.setTextSize(2);
+        tft.setTextColor(sel ? C_ACCENT : C_LIGHT_GRAY);
+
+        if (i == LOCAL_ROW_START) {
+            tft.setCursor(20, y + 9);
+            tft.print("Start game");
+        } else {   // LOCAL_ROW_TIME
+            const char *val = LOCAL_TIME_PRESETS[gs->cfg_time_idx].label;
+            tft.setCursor(16, y + 9);
+            tft.print("Clock");
+            int vw = (int)strlen(val) * 12;
+            tft.setTextColor(C_WHITE);
+            tft.setCursor(D_W - 16 - vw, y + 9);
+            tft.print(val);
+        }
+    }
+
+    tft.setTextColor(C_DIM);
+    tft.setTextSize(1);
+    tft.setCursor(6, 292);
+    tft.print("UP/DN move  OK change");
+    tft.setCursor(6, 304);
+    tft.print("CANCEL = back");
+}
+
 // --- WiFi / token setup screen -----------------------------------------------
 //
 // static instructions shown while the captive portal is up. all the details are
@@ -559,125 +548,120 @@ static void redraw_promo_tiles(const GameState_t *gs) {
         draw_promo_tile(i, i == gs->promo_cursor);
 }
 
+// --- frame rendering ---------------------------------------------------------
+
+enum DispScreen {
+    SCR_NONE, SCR_MENU, SCR_ONLINE_CFG, SCR_BOT_CFG, SCR_LOCAL_CFG, SCR_SETUP,
+    SCR_NOTICE, SCR_CONFIRM, SCR_GAMEOVER, SCR_BOARD, SCR_MATCH, SCR_PROMO
+};
+
+// persistent display state across frames (which screen is up, cursors, and the
+// local clock baseline so a live match counts down between server updates)
+struct DispState {
+    DispScreen shown;
+    uint8_t    last_menu_cursor;
+    uint8_t    last_promo_cursor;
+    uint32_t   base_my_ms;
+    uint32_t   base_opp_ms;
+    TickType_t base_tick;
+    bool       my_turn;
+};
+
+// draw the right screen for this frame. the caller holds xSPI18Mutex. got==false
+// means no new GameState arrived -- only the live match clock ticks
+static void render_frame(const GameState_t *gs, DispState *st, bool got) {
+    if (!got) {
+        if (st->shown == SCR_MATCH) {
+            uint32_t elapsed = (xTaskGetTickCount() - st->base_tick) * portTICK_PERIOD_MS;
+            uint32_t my_ms   = st->base_my_ms;
+            uint32_t opp_ms  = st->base_opp_ms;
+            if (st->my_turn) my_ms  = elapsed < st->base_my_ms  ? st->base_my_ms  - elapsed : 0;
+            else             opp_ms = elapsed < st->base_opp_ms ? st->base_opp_ms - elapsed : 0;
+            draw_match_clocks(my_ms, opp_ms, st->my_turn);
+        }
+        return;
+    }
+
+    if (gs->ui_screen == UI_SETUP) {
+        if (st->shown != SCR_SETUP) render_setup();
+        st->shown = SCR_SETUP; return;
+    }
+    if (gs->ui_screen == UI_NOTICE) {
+        if (st->shown != SCR_NOTICE) render_notice(gs, false);
+        st->shown = SCR_NOTICE; return;
+    }
+    if (gs->ui_screen == UI_CONFIRM) {
+        if (st->shown != SCR_CONFIRM) render_confirm();
+        st->shown = SCR_CONFIRM; return;
+    }
+    if (gs->ui_screen == UI_GAMEOVER) {
+        if (st->shown != SCR_GAMEOVER) render_notice(gs, true);
+        st->shown = SCR_GAMEOVER; return;
+    }
+    if (gs->ui_screen == UI_MENU) {
+        if (st->shown != SCR_MENU || gs->menu_cursor != st->last_menu_cursor) render_menu(gs);
+        st->shown = SCR_MENU; st->last_menu_cursor = gs->menu_cursor; return;
+    }
+    if (gs->ui_screen == UI_ONLINE_CFG) { render_online_cfg(gs); st->shown = SCR_ONLINE_CFG; return; }
+    if (gs->ui_screen == UI_BOT_CFG)    { render_bot_cfg(gs);    st->shown = SCR_BOT_CFG;    return; }
+    if (gs->ui_screen == UI_LOCAL_CFG)  { render_local_cfg(gs);  st->shown = SCR_LOCAL_CFG;  return; }
+
+    if (gs->promo_state == PROMO_SELECTING) {
+        if (st->shown != SCR_PROMO)                      render_promo_picker(gs);
+        else if (gs->promo_cursor != st->last_promo_cursor) redraw_promo_tiles(gs);
+        st->shown = SCR_PROMO; st->last_promo_cursor = gs->promo_cursor; return;
+    }
+
+    // a live timed match if either clock is running, otherwise the board
+    if (gs->white_clock_ms || gs->black_clock_ms) {
+        st->base_my_ms  = gs->my_color == 0 ? gs->white_clock_ms : gs->black_clock_ms;
+        st->base_opp_ms = gs->my_color == 0 ? gs->black_clock_ms : gs->white_clock_ms;
+        st->base_tick   = xTaskGetTickCount();
+        st->my_turn     = (gs->active_color == gs->my_color);
+        render_match_static(gs);
+        draw_match_clocks(st->base_my_ms, st->base_opp_ms, st->my_turn);
+        st->shown = SCR_MATCH;
+    } else {
+        render_game_state(gs);
+        st->shown = SCR_BOARD;
+    }
+}
+
 // --- task --------------------------------------------------------------------
 
 void task_LcdDisplay(void *pvParameters) {
-    hspi.begin(LCD_SCLK, /*MISO*/-1, LCD_MOSI, LCD_CS);
-    tft.init(170, 320, SPI_MODE2);
-    tft.setRotation(0);
-    tft.fillScreen(C_BLACK);
+    // backlight on
+    pinMode(LCD_BL, OUTPUT);
+    digitalWrite(LCD_BL, HIGH);
 
-    if (LCD_BL >= 0) {
-        pinMode(LCD_BL, OUTPUT);
-        digitalWrite(LCD_BL, HIGH);
-    }
+    // bare-minimum ST7789 bring-up for the 1.9" 170x320 panel
+    LCD_LOCK();
+    tft.begin();
+    tft.setRotation(2);   // 180 -- panel is mounted with USB-C at the top
 
-    tft.setTextColor(C_WHITE);
-    tft.setTextSize(2);
-    tft.setCursor(14, 140);
-    tft.print("ChessLink");
-    tft.setTextColor(C_DIM);
-    tft.setTextSize(1);
-    tft.setCursor(44, 162);
-    tft.print("initializing...");
+    // power-on test: a solid red screen. if you see RED, the panel is being
+    // driven; if it stays dark, the init/library still isn't right
+    tft.fillScreen(C_RED);
+    LCD_UNLOCK();
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    GameState_t  gs                = {};
-    uint8_t      last_promo_cursor = 0xFF;
+    LCD_LOCK();
+    tft.fillScreen(C_BLACK);
+    tft.setTextColor(C_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(10, 150);
+    tft.print("ChessLink");
+    LCD_UNLOCK();
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
-    // which screen is currently up, so we only full-redraw on a real change
-    enum { SCR_NONE, SCR_MENU, SCR_ONLINE_CFG, SCR_BOT_CFG, SCR_SETUP, SCR_NOTICE, SCR_CONFIRM, SCR_GAMEOVER, SCR_BOARD, SCR_MATCH, SCR_PROMO } shown = SCR_NONE;
-    uint8_t last_menu_cursor = 0xFF;
-
-    // local clock tracking -- lichess only sends fresh times on a move, so we
-    // count the running side down locally between updates for a live feel
-    uint32_t   base_my_ms  = 0;
-    uint32_t   base_opp_ms = 0;
-    TickType_t base_tick   = 0;
-    bool       my_turn     = false;
+    GameState_t gs = {};
+    DispState   st = { SCR_NONE, 0xFF, 0xFF, 0, 0, 0, false };
 
     for (;;) {
         bool got = (xQueueReceive(xQ_GameState, &gs, pdMS_TO_TICKS(250)) == pdTRUE);
-
-        if (got) {
-            if (gs.ui_screen == UI_SETUP) {
-                if (shown != SCR_SETUP) render_setup();
-                shown = SCR_SETUP;
-                continue;
-            }
-
-            if (gs.ui_screen == UI_NOTICE) {
-                if (shown != SCR_NOTICE) render_notice(&gs, false);
-                shown = SCR_NOTICE;
-                continue;
-            }
-
-            if (gs.ui_screen == UI_CONFIRM) {
-                if (shown != SCR_CONFIRM) render_confirm();
-                shown = SCR_CONFIRM;
-                continue;
-            }
-
-            if (gs.ui_screen == UI_GAMEOVER) {
-                if (shown != SCR_GAMEOVER) render_notice(&gs, true);
-                shown = SCR_GAMEOVER;
-                continue;
-            }
-
-            if (gs.ui_screen == UI_MENU) {
-                if (shown != SCR_MENU || gs.menu_cursor != last_menu_cursor)
-                    render_menu(&gs);
-                shown = SCR_MENU;
-                last_menu_cursor = gs.menu_cursor;
-                continue;
-            }
-
-            if (gs.ui_screen == UI_ONLINE_CFG) {
-                render_online_cfg(&gs);   // published only on changes -> redraw
-                shown = SCR_ONLINE_CFG;
-                continue;
-            }
-
-            if (gs.ui_screen == UI_BOT_CFG) {
-                render_bot_cfg(&gs);
-                shown = SCR_BOT_CFG;
-                continue;
-            }
-
-            if (gs.promo_state == PROMO_SELECTING) {
-                if (shown != SCR_PROMO)                 render_promo_picker(&gs);
-                else if (gs.promo_cursor != last_promo_cursor) redraw_promo_tiles(&gs);
-                shown = SCR_PROMO;
-                last_promo_cursor = gs.promo_cursor;
-                continue;
-            }
-
-            // a live timed match if either clock is running
-            if (gs.white_clock_ms || gs.black_clock_ms) {
-                base_my_ms  = gs.my_color == 0 ? gs.white_clock_ms : gs.black_clock_ms;
-                base_opp_ms = gs.my_color == 0 ? gs.black_clock_ms : gs.white_clock_ms;
-                base_tick   = xTaskGetTickCount();
-                my_turn     = (gs.active_color == gs.my_color);
-
-                render_match_static(&gs);
-                draw_match_clocks(base_my_ms, base_opp_ms, my_turn);
-                shown = SCR_MATCH;
-            } else {
-                render_game_state(&gs);
-                shown = SCR_BOARD;
-            }
-            continue;
-        }
-
-        // no new state -- tick the running clock down while a match is on screen
-        if (shown == SCR_MATCH) {
-            uint32_t elapsed = (xTaskGetTickCount() - base_tick) * portTICK_PERIOD_MS;
-            uint32_t my_ms   = base_my_ms;
-            uint32_t opp_ms  = base_opp_ms;
-            if (my_turn) my_ms  = elapsed < base_my_ms  ? base_my_ms  - elapsed : 0;
-            else         opp_ms = elapsed < base_opp_ms ? base_opp_ms - elapsed : 0;
-            draw_match_clocks(my_ms, opp_ms, my_turn);
-        }
+        LCD_LOCK();
+        render_frame(&gs, &st, got);
+        LCD_UNLOCK();
     }
 
     vTaskDelete(NULL);

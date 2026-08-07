@@ -20,14 +20,26 @@ Firmware pins (chesslink.h) now match `ChessLink_Pin_Map_v3.xlsx` exactly.
 
 Spare on the PCB: 21, 22, 26, 27, 33, 13, 14. Reserved: 1/3 (UART debug), 6-11 (flash).
 
-## Sensor read (bit-banged, no SPI)
+## Shared VSPI bus (LCD + shift registers)
 
-`task_sensor` reads the single 64-bit HC165 chain by bit-banging: it pulses
-`SR_LOAD` low to latch, then clocks `SR_SCLK` (GPIO18) 64 times, reading one bit
-per tick off `SR_MISO` (GPIO19). This matches the validated detection sketch and
-means the sensor task no longer uses the SPI peripheral at all. GPIO18 is the
-shift-register clock only in firmware (the LCD driver runs on its own HSPI pins),
-so there is no shared-bus contention to manage.
+The ideaspark board wires the LCD and the HC165 chain onto the ESP32 default VSPI
+pins: **SCK 18, MISO 19, MOSI 23**. `SPI.begin(18, 19, 23, -1)` runs once in
+`setup()` (SS left off so GPIO5 stays free for the SR latch). The LCD is driven by
+hardware SPI (`Adafruit_ST7789(&SPI, ...)`); the shift registers are read on the
+same bus with `SPI.transfer` (MODE0, MSBFIRST) after a `SR_LOAD` (GPIO5) latch.
+
+The sensor (`task_sensor`) and display (`task_display`) each hold `xSPI18Mutex`
+around their bus access so a sensor read can't be clocked apart by an LCD write.
+The SR shifting during an LCD write is harmless -- we re-latch before every read,
+and the LCD's CS (GPIO15) is de-asserted while the sensor reads, so the panel
+ignores those clocks.
+
+**Square -> bit order:** the chain clocks out in canonical order
+(a1,b1..h8). Read over SPI, byte `b` holds rank `b` with file a in the MSB and
+file h in the LSB; active-low (0 = occupied). This reproduces the validated
+identity map (host-tested in `srmap.c`). If a rank/file comes out mirrored,
+adjust the unpack loop in `sr_read_all`; if the whole read is wrong, try
+`SPI_MODE0` -> `SPI_MODE2` (clock idle polarity).
 
 ## Bring-up watch items
 

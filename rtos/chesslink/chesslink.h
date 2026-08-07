@@ -8,20 +8,26 @@
 
 // --- pin definitions ---------------------------------------------------------
 
-// SN74HC165 shift registers (VSPI)
-#define SR_SCLK       18
-#define SR_MISO       19   // QH from rank 1 SR
-#define SR_LOAD       5    // active-low parallel load, bit-banged
+// SN74HC165 shift registers -- read over the VSPI hardware bus (SR_SCLK/SR_MISO
+// are VSPI SCK/MISO, shared with the LCD; see below). SR_LOAD is a plain GPIO
+// latch. the ideaspark board wires these to the ESP32 default VSPI pins
+#define SR_SCLK       18   // VSPI SCK, shared with the LCD
+#define SR_MISO       19   // VSPI MISO -- QH from the SR chain
+#define SR_LOAD       5    // parallel load (PL), active-low, bit-banged latch
 
 // WS2812B via 74AHCT125 level shifter
-#define LED_DATA_PIN  25   // RMT output -> level shifter -> LED_DATA_5V (PCB v3, matches validated sketch)
+#define LED_DATA_PIN  25   // RMT output -> level shifter -> LED_DATA_5V
 
-// ST7789 LCD (HSPI) -- 170x320
-#define LCD_MOSI      13
-#define LCD_SCLK      14
+// ST7789 LCD (170x320) on the SAME VSPI bus as the shift registers. the LCD
+// writes on MOSI, the SR reads on MISO, both clocked by SCLK 18. the sensor and
+// display tasks hold xSPI18Mutex around their transactions so a sensor read
+// isn't clocked apart by an LCD write (and the SR shifting during LCD writes is
+// harmless -- we re-latch before every read, and the LCD's CS is high while we read)
+#define LCD_MOSI      23   // VSPI MOSI, shared with the SR bus
+#define LCD_SCLK      18   // = SR_SCLK
 #define LCD_CS        15
 #define LCD_DC        2
-#define LCD_RST       -1
+#define LCD_RST       4
 #define LCD_BL        32
 
 // tactile buttons (input-only pins, no internal pullup -- needs external 10k to 3.3V)
@@ -39,9 +45,9 @@
 
 #define STACK_SENSOR    4096
 #define STACK_LED       4096
-#define STACK_GAME      6144
-#define STACK_DISPLAY   4096
-#define STACK_NETWORK   8192
+#define STACK_GAME      8192    // engine + move-gen buffers + big GameCtx local
+#define STACK_DISPLAY   8192    // Arduino_GFX needs more than 4k (test task has 8k)
+#define STACK_NETWORK   16384   // WiFi + captive portal (WebServer/DNS) + TLS
 #define STACK_BUTTONS   2048
 
 // higher = more urgent
@@ -64,7 +70,7 @@
 // queue depths
 #define Q_BOARD_STATE_DEPTH   4
 #define Q_LED_CMD_DEPTH       8
-#define Q_GAME_STATE_DEPTH    4
+#define Q_GAME_STATE_DEPTH    1    // must be 1: publish_game_state uses xQueueOverwrite
 #define Q_MOVE_DEPTH          4
 #define Q_BUTTON_DEPTH        8
 #define Q_NET_CMD_DEPTH       4
@@ -120,6 +126,7 @@ typedef enum {
     UI_MENU,       // mode-select menu
     UI_ONLINE_CFG, // online rated-match config submenu
     UI_BOT_CFG,    // play-computer (Stockfish) config submenu
+    UI_LOCAL_CFG,  // local over-the-board config (clock) submenu
     UI_GAME,       // in a game -- board / match / promo screens
     UI_SETUP,      // WiFi/token captive-portal instructions
     UI_NOTICE,     // transient status ("seeking...") -- no button prompt
@@ -141,6 +148,8 @@ extern const TimePreset_t ONLINE_TIME_PRESETS[];
 extern const int          ONLINE_TIME_COUNT;
 extern const TimePreset_t BOT_TIME_PRESETS[];
 extern const int          BOT_TIME_COUNT;
+extern const TimePreset_t LOCAL_TIME_PRESETS[];
+extern const int          LOCAL_TIME_COUNT;
 
 // online rated-match config rows
 #define CFG_ROW_TIME   0
@@ -156,6 +165,11 @@ extern const int          BOT_TIME_COUNT;
 #define BOT_ROW_COUNT  4
 #define BOT_LEVEL_MIN  1
 #define BOT_LEVEL_MAX  8
+
+// local over-the-board config rows (clock control + start)
+#define LOCAL_ROW_TIME   0
+#define LOCAL_ROW_START  1
+#define LOCAL_ROW_COUNT  2
 
 // soft-AP shown during first-boot / on-demand WiFi + token setup
 #define WIFI_SETUP_AP_SSID "ChessLink-Setup"
@@ -182,6 +196,7 @@ typedef struct {
 // coarse network state the network task reports up for the display
 typedef enum {
     NET_STATUS_SETUP,       // captive portal is up, waiting for the phone
+    NET_STATUS_CONNECTING,  // creds submitted, joining WiFi
     NET_STATUS_ONLINE,      // connected to WiFi, ready
 } NetStatus_t;
 
@@ -205,6 +220,14 @@ typedef struct {
     bool     has_clocks;    // the clock fields below are valid
     uint32_t white_clock_ms;
     uint32_t black_clock_ms;
+
+    // authoritative full-position sync: the server's move list rebuilt into a
+    // FEN. the game task adopts this as truth, so online play can never drift.
+    bool     has_sync;
+    char     sync_fen[92];
+    bool     sync_have_last;    // last-move squares below are valid (LED guidance)
+    uint8_t  sync_from;
+    uint8_t  sync_to;
 } NetUpdate_t;
 
 typedef struct {
@@ -262,6 +285,10 @@ extern QueueHandle_t xQ_OpponentMove;
 extern QueueHandle_t xQ_ButtonEvent;
 extern QueueHandle_t xQ_NetCmd;
 extern QueueHandle_t xQ_NetUpdate;
+
+// serializes access to the shared SR/LCD clock net (GPIO18): the sensor and the
+// display each hold it while bit-banging so their edges never interleave
+extern SemaphoreHandle_t xSPI18Mutex;
 
 // --- task declarations -------------------------------------------------------
 

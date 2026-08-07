@@ -12,6 +12,8 @@ QueueHandle_t xQ_ButtonEvent;
 QueueHandle_t xQ_NetCmd;
 QueueHandle_t xQ_NetUpdate;
 
+SemaphoreHandle_t xSPI18Mutex;
+
 // --- setup -------------------------------------------------------------------
 
 void setup() {
@@ -30,9 +32,11 @@ void setup() {
     xQ_NetCmd       = xQueueCreate(Q_NET_CMD_DEPTH,        sizeof(NetCmdMsg_t));
     xQ_NetUpdate    = xQueueCreate(Q_NET_UPDATE_DEPTH,     sizeof(NetUpdate_t));
 
+    xSPI18Mutex     = xSemaphoreCreateMutex();
+
     if (!xQ_BoardState || !xQ_LedCmd || !xQ_GameState ||
         !xQ_PlayerMove || !xQ_OpponentMove || !xQ_ButtonEvent ||
-        !xQ_NetCmd || !xQ_NetUpdate) {
+        !xQ_NetCmd || !xQ_NetUpdate || !xSPI18Mutex) {
         Serial.println("[chesslink] fatal: queue allocation failed");
         while (1) {}
     }

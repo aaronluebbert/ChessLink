@@ -62,11 +62,13 @@ The shared contract: pins, RTOS config, all cross-task data types, queue externs
 task prototypes, and the online/bot config tables. This is the most important
 file to get right; everything else depends on it.
 
-Pins (`#define`): shift registers on VSPI -- `SR_SCLK 18`, `SR_MISO 19`,
-`SR_LOAD 5`. LEDs `LED_DATA_PIN 25` (WS2812B via a 74AHCT125 level shifter). LCD
-on HSPI -- `LCD_MOSI 13`, `LCD_SCLK 14`, `LCD_CS 15`, `LCD_DC 2`, `LCD_RST -1`,
-`LCD_BL 32`. Buttons (input-only pins, external 10k pull-ups, active-low):
-`BTN_UP 36`, `BTN_DOWN 39`, `BTN_CONFIRM 34`, `BTN_CANCEL 35`.
+Pins (`#define`): the LCD and shift registers share the ESP32 VSPI bus --
+`SR_SCLK`/`LCD_SCLK 18` (SCK), `SR_MISO 19` (MISO, SR data), `LCD_MOSI 23` (MOSI,
+LCD data); `SR_LOAD 5` is the SR latch. LCD control: `LCD_CS 15`, `LCD_DC 2`,
+`LCD_RST 4`, `LCD_BL 32`. LEDs `LED_DATA_PIN 25` (WS2812B via a 74AHCT125 level
+shifter). Both tasks hold `xSPI18Mutex` around bus access. Buttons (input-only,
+external 10k pull-ups, active-low): `BTN_UP 36`, `BTN_DOWN 39`, `BTN_CONFIRM 34`,
+`BTN_CANCEL 35`.
 
 `NUM_SQUARES 64`. Stack sizes (`STACK_SENSOR 4096` ... `STACK_NETWORK 8192`),
 priorities (`PRI_*`), cores (`CORE_*`), queue depths (`Q_*_DEPTH`, mostly 4-8),
@@ -102,7 +104,8 @@ Enums and structs (exact fields matter -- queues copy by value):
   `my_rating`/`opp_rating`/`my_color`), `promo_state`, `promo_cursor`.
 - `MoveEvent_t { uint8_t from_sq, to_sq; char uci[6]; uint32_t white_clock_ms, black_clock_ms; }` -- carried on `xQ_PlayerMove` and `xQ_OpponentMove` (clocks only meaningful on opponent events).
 
-Queue externs and the six task prototypes. Also `void chess_engine_init();`.
+Queue externs, `extern SemaphoreHandle_t xSPI18Mutex;` (guards the shared GPIO18
+clock), and the six task prototypes. Also `void chess_engine_init();`.
 
 Note: clocks are stored as absolute remaining ms; the server value already
 includes increment, so increments are intentionally not tracked.
@@ -148,16 +151,18 @@ is authoritative in `Position::all` -- the game task relies on this.
 
 --------------------------------------------------------------------------------
 ## task_sensor.cpp  (task_SensorScan)
-Reads the 64-sensor HC165 chain and posts a debounced occupancy bitmask.
+Reads the 64-sensor HC165 chain over the shared VSPI bus and posts a debounced
+occupancy bitmask.
 
-Bit-bangs the chain (no SPI peripheral): set `SR_LOAD` output/idle-high,
-`SR_SCLK` output/idle-low, `SR_MISO` `INPUT_PULLUP`. `sr_read_all()` pulses
-`SR_LOAD` low->high to latch, then for each of 64 bits reads `SR_MISO` (active-low:
-LOW = piece present) into `occupied` at `cl_sensor_sq(bit)`, pulsing `SR_SCLK`
-between bits (5us delays). Loop: read; require `DEBOUNCE_SCANS` identical reads in
-a row before accepting a change; on an accepted change build `BoardState_t {occupied}`
-and `xQueueSend(xQ_BoardState)`, dropping the oldest queued item if full;
-`vTaskDelayUntil` every `SENSOR_SCAN_MS`.
+`SR_LOAD` is a plain GPIO latch (idle high); `SR_SCLK`/`SR_MISO` belong to VSPI
+(`SPI.begin` runs in `main`). `sr_read_all()` pulses `SR_LOAD` low->high to latch,
+then `SPI.beginTransaction(1MHz, MSBFIRST, SPI_MODE0)` and reads 8 bytes with
+`SPI.transfer(0)`. Unpack: byte `b` = rank `b`; within a byte MSB..LSB = file
+a..h; active-low (0 = occupied), so `occupied |= 1<<(b*8+f)` when bit `(7-f)` is 0.
+Loop: take `xSPI18Mutex` (GPIO18 shared with the LCD), `sr_read_all()`, give it;
+require `DEBOUNCE_SCANS` identical reads before accepting a change; on a change
+build `BoardState_t {occupied}` and `xQueueSend(xQ_BoardState)` (drop oldest if
+full); `vTaskDelayUntil` every `SENSOR_SCAN_MS`.
 
 --------------------------------------------------------------------------------
 ## task_led.cpp  (task_LedControl)
@@ -254,8 +259,12 @@ skip the rest while in menu; take an opponent move only when `PHASE_IDLE` and no
 --------------------------------------------------------------------------------
 ## task_display.cpp  (task_LcdDisplay)
 Renders `GameState_t` on the ST7789 (170x320 portrait, USB-C at top,
-`setRotation(0)`). HSPI via `SPIClass hspi(HSPI)`; palette `#define`s (C_BG,
-C_ACCENT, etc.). Board layout constants (header/turn/move/status/board rects).
+`setRotation(0)`). Hardware SPI on the shared VSPI bus: `Adafruit_ST7789(&SPI,
+LCD_CS, LCD_DC, LCD_RST)`. `LCD_LOCK()/LCD_UNLOCK()` wrap `xSPI18Mutex`, held
+around the init burst and every frame render (so a render isn't clocked apart by
+a sensor read). The task turns the backlight (`LCD_BL`) on *first*, before
+`tft.init` -- so a lit-but-blank panel points at init/data, not power. Palette
+`#define`s (C_BG, C_ACCENT, etc.). Board layout constants.
 
 Helpers: `fen_to_squares` (FEN piece-placement -> 64-char array);
 `draw_board_square`/`draw_mini_board` (8x8 with piece letters in circles);
@@ -273,13 +282,14 @@ message; terminal adds "press a button for the menu", transient adds "please
 wait..."); `render_confirm` ("Leave game? OK=yes CANCEL=no"); promotion picker
 (2x2 tiles, UP/DOWN choose, CONFIRM confirm) with `redraw_promo_tiles`.
 
-Task: init hspi + `tft.init(170,320,SPI_MODE2)`, backlight on, splash, then a
-loop with a `shown` enum to avoid needless full redraws. On each `GameState`
-select by `ui_screen`: SETUP, CONFIRM, NOTICE, GAMEOVER, MENU, ONLINE_CFG,
-BOT_CFG, or (in a game) PROMO if `promo_state==SELECTING`, MATCH if either clock
-is nonzero, else BOARD. The match screen also ticks locally: on a `GameState`
-timeout it decrements the running side from the last server value and redraws
-only the clock band.
+Task: `tft.init(170,320)`, backlight on, splash (all under the lock), then a loop
+that receives a `GameState` (250ms timeout), takes the lock, calls `render_frame`,
+releases. `render_frame(gs, DispState*, got)` holds a `DispState` (current screen +
+cursors + clock baseline) and selects by `ui_screen`: SETUP, CONFIRM, NOTICE,
+GAMEOVER, MENU, ONLINE_CFG, BOT_CFG, or (in a game) PROMO if
+`promo_state==SELECTING`, MATCH if either clock is nonzero, else BOARD. When no
+new state arrives and a match is up, it ticks the running clock down locally from
+the last server value and redraws only the clock band.
 
 --------------------------------------------------------------------------------
 ## task_network.cpp  (task_Network)
