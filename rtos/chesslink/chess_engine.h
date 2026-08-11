@@ -137,3 +137,6 @@ Move uci_to_move(const Position *pos, const char *uci);
 
 // write UCI string for a move into out (needs at least 6 bytes)
 void move_to_uci(Move m, char *out);
+
+// Standard Algebraic Notation for a move played from `pos` (used to build PGN)
+void move_to_san(const Position *pos, Move m, char *out, size_t n);

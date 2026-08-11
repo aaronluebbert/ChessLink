@@ -591,6 +591,62 @@ void move_to_uci(Move m, char *out) {
     }
 }
 
+// Standard Algebraic Notation for `m`, played from position `pos` (before the
+// move). Handles castling, captures, pawn-capture file, disambiguation, promotion
+// and the +/# check suffix. Needed to build a PGN for lichess import.
+void move_to_san(const Position *pos, Move m, char *out, size_t n) {
+    static const char PC_LETTER[6] = { 0, 'N', 'B', 'R', 'Q', 'K' };
+    char buf[16];
+    int  p = 0;
+    uint8_t   from = MV_FROM(m), to = MV_TO(m);
+    PieceType pc   = MV_PIECE(m);
+
+    if (MV_IS_CASTLE(m)) {
+        const char *cast = (FILE_OF(to) > FILE_OF(from)) ? "O-O" : "O-O-O";
+        while (*cast) buf[p++] = *cast++;
+    } else {
+        bool capture = MV_IS_CAPTURE(m);
+        if (pc == PAWN) {
+            if (capture) buf[p++] = 'a' + FILE_OF(from);   // pawn captures name the file
+        } else {
+            buf[p++] = PC_LETTER[pc];
+            // disambiguate against other same-type pieces that can also reach `to`
+            Move legal[MAX_MOVES];
+            int  nl = gen_legal_moves(pos, legal);
+            bool amb = false, sameFile = false, sameRank = false;
+            for (int i = 0; i < nl; i++) {
+                if (MV_TO(legal[i]) == to && MV_PIECE(legal[i]) == pc
+                    && MV_FROM(legal[i]) != from) {
+                    amb = true;
+                    if (FILE_OF(MV_FROM(legal[i])) == FILE_OF(from)) sameFile = true;
+                    if (RANK_OF(MV_FROM(legal[i])) == RANK_OF(from)) sameRank = true;
+                }
+            }
+            if (amb) {
+                if (!sameFile)      buf[p++] = 'a' + FILE_OF(from);
+                else if (!sameRank) buf[p++] = '1' + RANK_OF(from);
+                else { buf[p++] = 'a' + FILE_OF(from); buf[p++] = '1' + RANK_OF(from); }
+            }
+        }
+        if (capture) buf[p++] = 'x';
+        buf[p++] = 'a' + FILE_OF(to);
+        buf[p++] = '1' + RANK_OF(to);
+        if (MV_IS_PROMO(m)) { buf[p++] = '='; buf[p++] = PC_LETTER[MV_PROMO(m)]; }
+    }
+
+    // check / checkmate suffix
+    Position tmp = *pos, undo;
+    make_move_pos(&tmp, m, &undo);
+    if (in_check(&tmp, tmp.side)) {
+        Move rep[MAX_MOVES];
+        buf[p++] = (gen_legal_moves(&tmp, rep) == 0) ? '#' : '+';
+    }
+
+    buf[p] = '\0';
+    strncpy(out, buf, n - 1);
+    out[n - 1] = '\0';
+}
+
 Move uci_to_move(const Position *pos, const char *uci) {
     if (!uci || strlen(uci) < 4) return MOVE_NONE;
 

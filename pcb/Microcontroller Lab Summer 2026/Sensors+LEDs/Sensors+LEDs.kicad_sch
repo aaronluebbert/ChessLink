@@ -5212,7 +5212,7 @@
 				)
 			)
 		)
-		(property "Footprint" "Package_DIP:DIP-16_W10.16mm_LongPads"
+		(property "Footprint" "Package_DIP:DIP-16_W7.62mm_LongPads"
 			(at 168.91 137.16 0)
 			(hide yes)
 			(show_name no)

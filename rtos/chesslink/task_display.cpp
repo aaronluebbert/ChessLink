@@ -485,8 +485,13 @@ static void render_notice(const GameState_t *gs, bool terminal) {
     print_centered(gs->status_msg, 150, sz, C_ACCENT);
 
     if (terminal) {
-        print_centered("press a button", 286, 1, C_DIM);
-        print_centered("for the menu",   300, 1, C_DIM);
+        if (gs->offer_import) {
+            print_centered("OK = analyze on Lichess", 280, 1, C_GREEN);
+            print_centered("any other = menu",        298, 1, C_DIM);
+        } else {
+            print_centered("press a button", 286, 1, C_DIM);
+            print_centered("for the menu",   300, 1, C_DIM);
+        }
     } else {
         print_centered("please wait...", 300, 1, C_DIM);
     }
@@ -629,7 +634,7 @@ static void render_frame(const GameState_t *gs, DispState *st, bool got) {
         st->shown = SCR_CONFIRM; return;
     }
     if (gs->ui_screen == UI_GAMEOVER) {
-        if (st->shown != SCR_GAMEOVER) render_notice(gs, true);
+        render_notice(gs, true);   // re-render each update (status changes: result -> importing -> URL)
         st->shown = SCR_GAMEOVER; return;
     }
     if (gs->ui_screen == UI_MENU) {

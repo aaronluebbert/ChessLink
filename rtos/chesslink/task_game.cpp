@@ -101,6 +101,7 @@ typedef struct {
     Move        replay_move;          // the current scripted move (applied on success)
     uint8_t     replay_from;
     uint8_t     replay_to;
+    uint64_t    replay_lifted;        // squares physically emptied during this move
 
     // config submenus
     uint8_t     cfg_cursor;    // CFG_ROW_* / BOT_ROW_*
@@ -117,6 +118,12 @@ typedef struct {
     TickType_t  turn_start;        // tick the side-to-move's turn began (local clock)
     bool        untimed;           // no time control -> never show clocks, even if
                                    // the server still sends clock data
+
+    // local-game PGN capture (for "analyze on lichess" import after the game)
+    char        movetext[1024];    // "1. e4 e5 2. Nf3 ..." built as moves are made
+    char        result_pgn[8];     // "1-0" / "0-1" / "1/2-1/2" / "*"
+    int         ply_count;         // half-moves recorded (for move numbering)
+    bool        imported;          // already sent to lichess (don't re-import)
 
     // live-match players (filled from the lichess gameFull event via NetUpdate)
     char        my_name[20];
@@ -200,6 +207,8 @@ static void publish_game_state(const GameCtx_t *ctx) {
                     : ctx->in_notice                   ? UI_NOTICE
                                                        : UI_GAME;
     gs.menu_cursor  = ctx->menu_cursor;
+    gs.offer_import = (ctx->phase == PHASE_GAME_OVER && ctx->mode == GAME_MODE_LOCAL
+                       && ctx->movetext[0] && !ctx->imported);
     gs.cfg_cursor   = ctx->cfg_cursor;
     gs.cfg_time_idx = ctx->cfg_time_idx;
     gs.cfg_rated    = ctx->cfg_rated;
@@ -385,6 +394,12 @@ static void start_local(GameCtx_t *ctx) {
         ctx->white_clock_ms = ctx->black_clock_ms = 0;
     }
 
+    // reset the PGN capture for this game
+    ctx->movetext[0] = '\0';
+    strncpy(ctx->result_pgn, "*", sizeof(ctx->result_pgn) - 1);
+    ctx->ply_count = 0;
+    ctx->imported  = false;
+
     pos_from_fen(&ctx->pos, STARTPOS_FEN);
     strncpy(ctx->status_msg, "Set up the board", sizeof(ctx->status_msg) - 1);
     send_led_clear();
@@ -466,6 +481,11 @@ static void leave_game(GameCtx_t *ctx) {
         NetCmdMsg_t cmd = { .type = NET_CMD_RESIGN };
         xQueueSend(xQ_NetCmd, &cmd, 0);
         publish_game_state(ctx);
+    } else if (ctx->mode == GAME_MODE_LOCAL && ctx->movetext[0]) {
+        // a local game with moves -> go to the result screen so it can still be
+        // sent to lichess for analysis (result unknown -> "*")
+        strcpy(ctx->result_pgn, "*");
+        end_game(ctx, "Game ended");
     } else {
         enter_menu(ctx);
     }
@@ -515,6 +535,7 @@ static void replay_present_move(GameCtx_t *ctx) {
 
     ctx->replay_move    = m;
     ctx->replay_pre_occ = ctx->pos.all;
+    ctx->replay_lifted  = 0;
     ctx->replay_from    = (uint8_t)((uci[0] - 'a') + (uci[1] - '1') * 8);
     ctx->replay_to      = (uint8_t)((uci[2] - 'a') + (uci[3] - '1') * 8);
 
@@ -569,14 +590,18 @@ static void open_famous(GameCtx_t *ctx) {
 static bool check_local_end(GameCtx_t *ctx) {
     Move moves[MAX_MOVES];
     if (gen_legal_moves(&ctx->pos, moves) == 0) {
-        if (in_check(&ctx->pos, ctx->pos.side))
+        if (in_check(&ctx->pos, ctx->pos.side)) {
+            strcpy(ctx->result_pgn, ctx->pos.side == WHITE ? "0-1" : "1-0");
             end_game(ctx, ctx->pos.side == WHITE ? "Black wins: mate"
                                                  : "White wins: mate");
-        else
+        } else {
+            strcpy(ctx->result_pgn, "1/2-1/2");
             end_game(ctx, "Draw: stalemate");
+        }
         return true;
     }
     if (ctx->pos.halfmove >= 100) {
+        strcpy(ctx->result_pgn, "1/2-1/2");
         end_game(ctx, "Draw: 50-move rule");
         return true;
     }
@@ -587,6 +612,20 @@ static bool check_local_end(GameCtx_t *ctx) {
 static void commit_move(GameCtx_t *ctx, Move chosen) {
     char uci[6];
     move_to_uci(chosen, uci);
+
+    // record SAN into the movetext for later lichess analysis import (local games).
+    // done before make_move_pos so ctx->pos is the position the move is played from.
+    if (ctx->mode == GAME_MODE_LOCAL) {
+        char san[16];
+        move_to_san(&ctx->pos, chosen, san, sizeof(san));
+        size_t len = strlen(ctx->movetext);
+        if (ctx->pos.side == WHITE)
+            snprintf(ctx->movetext + len, sizeof(ctx->movetext) - len,
+                     "%s%d. %s", len ? " " : "", ctx->ply_count / 2 + 1, san);
+        else
+            snprintf(ctx->movetext + len, sizeof(ctx->movetext) - len, " %s", san);
+        ctx->ply_count++;
+    }
 
     // local clock: charge the mover for their think time, add the increment, then
     // hand the clock to the other side (make_move_pos flips ctx->pos.side below)
@@ -694,7 +733,16 @@ static void process_board_change(GameCtx_t *ctx, const BoardState_t *bs) {
 
     // famous-game study: wait for the scripted move to be made on the board.
     if (ctx->phase == PHASE_REPLAY) {
-        if (curr == ctx->replay_target) {
+        ctx->replay_lifted |= (ctx->replay_pre_occ & ~curr);   // squares emptied so far
+
+        // a capture leaves the same occupancy whether the captured piece is still
+        // on its square (own piece merely lifted) or gone -- so require the
+        // captured square to have physically been lifted before completing, else
+        // the move "finishes" the instant the capturing piece is picked up
+        bool is_capture = (ctx->replay_pre_occ & BB_SQ(ctx->replay_to)) != 0;
+        bool done = (curr == ctx->replay_target)
+                 && (!is_capture || (ctx->replay_lifted & BB_SQ(ctx->replay_to)));
+        if (done) {
             Position undo;
             make_move_pos(&ctx->pos, ctx->replay_move, &undo);  // advance the truth
             ctx->replay_idx++;
@@ -889,7 +937,22 @@ static void handle_button(GameCtx_t *ctx, ButtonEvent_t evt) {
     }
 
     // result screen -- any button returns to the menu
-    if (ctx->phase == PHASE_GAME_OVER) { enter_menu(ctx); return; }
+    if (ctx->phase == PHASE_GAME_OVER) {
+        // local game with moves -> OK sends it to lichess for phone analysis
+        if (ctx->mode == GAME_MODE_LOCAL && ctx->movetext[0] && !ctx->imported
+            && evt == BTN_EVT_CONFIRM) {
+            ctx->imported = true;
+            net_stage_import(ctx->movetext, ctx->result_pgn);
+            NetCmdMsg_t cmd = { .type = NET_CMD_IMPORT };
+            xQueueSend(xQ_NetCmd, &cmd, 0);
+            strncpy(ctx->status_msg, "Importing to Lichess...", sizeof(ctx->status_msg) - 1);
+            ctx->status_msg[sizeof(ctx->status_msg) - 1] = '\0';
+            publish_game_state(ctx);
+            return;
+        }
+        enter_menu(ctx);
+        return;
+    }
 
     // main mode-select menu
     if (ctx->in_menu) {
@@ -1171,7 +1234,11 @@ static void check_local_flag(GameCtx_t *ctx) {
 // --- task --------------------------------------------------------------------
 
 void task_GameLogic(void *pvParameters) {
-    GameCtx_t ctx = {};
+    // static, not on the stack: GameCtx_t is ~2KB (movetext + candidate tables)
+    // and the engine's move generators already use big stack buffers -- keeping
+    // this off the task stack avoids overflowing it (which corrupted memory and
+    // showed up as a queue assert after a handful of moves).
+    static GameCtx_t ctx = {};
 
     // placeholder names until a network game fills real ones
     // ratings and my_color stay 0 (white) from the {} init above
