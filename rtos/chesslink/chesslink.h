@@ -45,7 +45,7 @@
 
 #define STACK_SENSOR    4096
 #define STACK_LED       4096
-#define STACK_GAME      8192    // engine + move-gen buffers + big GameCtx local
+#define STACK_GAME      8192    // engine move-gen buffers (GameCtx is static, off-stack)
 #define STACK_DISPLAY   8192    // Arduino_GFX needs more than 4k (test task has 8k)
 #define STACK_NETWORK   16384   // WiFi + captive portal (WebServer/DNS) + TLS
 #define STACK_BUTTONS   2048
@@ -189,7 +189,12 @@ typedef enum {
     NET_CMD_START_BOT,      // challenge Stockfish, then stream it
     NET_CMD_RESIGN,         // resign/abort the current game (read mid-stream)
     NET_CMD_OPEN_SETUP,     // (re)open the captive portal to set WiFi + token
+    NET_CMD_IMPORT,         // import the staged PGN to lichess for analysis
 } NetCmd_t;
+
+// stage a game's movetext (SAN) + result before sending NET_CMD_IMPORT. the
+// network task wraps it in a PGN and POSTs it to lichess /api/import.
+void net_stage_import(const char *movetext, const char *result);
 
 // message on xQ_NetCmd -- the command plus game parameters
 typedef struct {
@@ -248,6 +253,7 @@ typedef struct {
     // top-level UI
     UiScreen_t  ui_screen;     // menu vs in-game
     uint8_t     menu_cursor;   // highlighted item when ui_screen == UI_MENU
+    bool        offer_import;  // game-over screen: offer "analyze on lichess"
 
     // config submenus (UI_ONLINE_CFG / UI_BOT_CFG)
     uint8_t     cfg_cursor;    // CFG_ROW_* / BOT_ROW_*

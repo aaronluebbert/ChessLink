@@ -91,10 +91,16 @@ button{width:100%;padding:12px;font-size:16px;border:0;background:#2d6cdf;color:
 static void setup_handle_root() { setup_web.send_P(200, "text/html", SETUP_PAGE); }
 
 static void setup_handle_save() {
+    String ssid = setup_web.arg("ssid");
+    String pass = setup_web.arg("pass");
+    String tok  = setup_web.arg("token");
+    Serial.printf("[net] setup form received: ssid='%s' (%u chars), password %u chars, token %u chars\n",
+                  ssid.c_str(), (unsigned)ssid.length(), (unsigned)pass.length(), (unsigned)tok.length());
+
     prefs.begin("wifi", false);   // read-write
-    prefs.putString("ssid",  setup_web.arg("ssid"));
-    prefs.putString("pass",  setup_web.arg("pass"));
-    prefs.putString("token", setup_web.arg("token"));
+    prefs.putString("ssid",  ssid);
+    prefs.putString("pass",  pass);
+    prefs.putString("token", tok);
     prefs.end();
 
     setup_web.send(200, "text/html",
@@ -124,6 +130,13 @@ static void run_setup_portal(void) {
 
     while (!setup_submitted) {
         setup_dns.processNextRequest();
+        setup_web.handleClient();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // keep servicing the client briefly so the "Saved" page actually reaches the
+    // phone before we tear the AP down
+    for (int i = 0; i < 30; i++) {
         setup_web.handleClient();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -187,19 +200,39 @@ static bool wifi_connect(void) {
         return false;
     }
 
-    Serial.printf("[net] connecting to %s...\n", ssid.c_str());
+    Serial.printf("[net] connecting to '%s' (password %u chars)...\n",
+                  ssid.c_str(), (unsigned)pass.length());
+
+    // Full radio reset before joining. This is critical right after the setup
+    // soft-AP: the radio is left in AP mode on a fixed channel, and going straight
+    // to WiFi.begin() usually fails the first join. Cycling OFF -> STA clears it.
+    WiFi.persistent(false);
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    WiFi.mode(WIFI_STA);
+    vTaskDelay(pdMS_TO_TICKS(100));
     WiFi.begin(ssid.c_str(), pass.c_str());
 
-    for (int elapsed = 0; elapsed < 15000 && WiFi.status() != WL_CONNECTED; elapsed += 500) {
-        vTaskDelay(pdMS_TO_TICKS(500));
+    int status = WiFi.status();
+    for (int elapsed = 0; elapsed < 20000 && status != WL_CONNECTED; elapsed += 250) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        status = WiFi.status();
         Serial.print(".");
     }
 
-    if (WiFi.status() == WL_CONNECTED) {
+    if (status == WL_CONNECTED) {
         Serial.printf("\n[net] connected -- IP %s\n", WiFi.localIP().toString().c_str());
         return true;
     }
-    Serial.println("\n[net] WiFi connect failed");
+
+    // status 1 = SSID not found (wrong name, out of range, or a 5GHz-only network
+    // -- the ESP32 is 2.4GHz only); 4 = auth failed (wrong password)
+    const char *why = (status == WL_NO_SSID_AVAIL)  ? "network not found (2.4GHz only!)"
+                    : (status == WL_CONNECT_FAILED) ? "auth failed (wrong password?)"
+                                                    : "no connection";
+    Serial.printf("\n[net] WiFi connect failed: status=%d (%s)\n", (int)status, why);
     return false;
 }
 
@@ -600,6 +633,70 @@ static bool lichess_challenge_ai(char *out_id, size_t id_len, const NetCmdMsg_t 
     return true;
 }
 
+// --- game import (post a finished game to lichess for phone analysis) ---------
+
+static char s_import_movetext[1024];   // "1. e4 e5 2. Nf3 ..." staged by the game task
+static char s_import_result[8];        // "1-0" / "0-1" / "1/2-1/2" / "*"
+
+void net_stage_import(const char *movetext, const char *result) {
+    strncpy(s_import_movetext, movetext ? movetext : "", sizeof(s_import_movetext) - 1);
+    s_import_movetext[sizeof(s_import_movetext) - 1] = '\0';
+    strncpy(s_import_result, (result && result[0]) ? result : "*", sizeof(s_import_result) - 1);
+    s_import_result[sizeof(s_import_result) - 1] = '\0';
+}
+
+// POST /api/import with a minimal PGN; on success return "lichess.org/<id>". With
+// our token the imported game lands in the account's "Imported games" list.
+static bool lichess_import(char *url_out, size_t n) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    // build the PGN
+    static char pgn[1300];
+    snprintf(pgn, sizeof(pgn),
+             "[Event \"ChessLink game\"]\n[White \"White\"]\n[Black \"Black\"]\n"
+             "[Result \"%s\"]\n\n%s %s\n",
+             s_import_result, s_import_movetext, s_import_result);
+
+    // url-encode it into the form body: "pgn=<encoded>"
+    static char body[4096];
+    static const char *hexd = "0123456789ABCDEF";   // not "HEX" -- Arduino defines that
+    int b = 0;
+    for (const char *p = "pgn="; *p && b < (int)sizeof(body) - 1; p++) body[b++] = *p;
+    for (int i = 0; pgn[i] && b < (int)sizeof(body) - 4; i++) {
+        char c = pgn[i];
+        bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                       || (c >= '0' && c <= '9') || c == '-' || c == '_'
+                       || c == '.' || c == '~';
+        if (unreserved) body[b++] = c;
+        else { body[b++] = '%'; body[b++] = hexd[(c >> 4) & 0xF]; body[b++] = hexd[c & 0xF]; }
+    }
+    body[b] = '\0';
+
+    HTTPClient http;
+    http.begin(LICHESS_BASE "/api/import");
+    add_auth(http);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    int code = http.POST(body);
+    if (code != 200 && code != 201) {
+        Serial.printf("[net] import failed: HTTP %d\n", code);
+        http.end();
+        return false;
+    }
+
+    String payload = http.getString();
+    http.end();
+
+    StaticJsonDocument<512> doc;
+    if (deserializeJson(doc, payload)) return false;
+    const char *id = doc["id"];
+    if (!id || !strlen(id)) return false;
+
+    snprintf(url_out, n, "lichess.org/%s", id);
+    Serial.printf("[net] imported: %s\n", url_out);
+    return true;
+}
+
 // --- task --------------------------------------------------------------------
 
 void task_Network(void *pvParameters) {
@@ -657,6 +754,16 @@ void task_Network(void *pvParameters) {
                 net_report(NET_STATUS_CONNECTING);  // feedback while we join WiFi
                 ensure_connected();                 // -> ONLINE (menu), or reopens the portal
                 net_state = NET_STATE_IDLE;
+
+            // import a finished local game to lichess for phone analysis
+            } else if (cmd.type == NET_CMD_IMPORT) {
+                if (lichess_token[0] == '\0') {
+                    net_report_result("No token: run setup");
+                } else {
+                    char url[40];
+                    if (lichess_import(url, sizeof(url))) net_report_result(url);
+                    else                                  net_report_result("Import failed");
+                }
             }
         }
 
