@@ -61,7 +61,10 @@ const int LOCAL_TIME_COUNT = sizeof(LOCAL_TIME_PRESETS) / sizeof(LOCAL_TIME_PRES
 #define LOCAL_DEFAULT_TIME_IDX 0   // Untimed (preserves the old instant-start default)
 
 // --- famous games (step-through study mode) ----------------------------------
-// The Immortal Game -- Anderssen vs Kieseritzky, London 1851 -- in UCI.
+// each game is a UCI move list, played from the standard start position
+// names are kept to 11 characters or fewer so they fit the list at text size 2
+
+// the immortal game, anderssen vs kieseritzky, london 1851, ends in mate on move 23
 static const char *IMMORTAL_MOVES[] = {
     "e2e4","e7e5","f2f4","e5f4","f1c4","d8h4","e1f1","b7b5","c4b5","g8f6",
     "g1f3","h4h6","d2d3","f6h5","f3h4","h6g5","h4f5","c7c6","g2g4","h5f6",
@@ -69,8 +72,51 @@ static const char *IMMORTAL_MOVES[] = {
     "b1c3","f8c5","c3d5","f6b2","f4d6","c5g1","e4e5","b2a1","f1e2","b8a6",
     "f5g7","e8d8","f3f6","g8f6","d6e7",
 };
+
+// the evergreen game, anderssen vs dufresne, berlin 1852, ends in mate on move 24
+static const char *EVERGREEN_MOVES[] = {
+    "e2e4","e7e5","g1f3","b8c6","f1c4","f8c5","b2b4","c5b4","c2c3","b4a5",
+    "d2d4","e5d4","e1g1","d4d3","d1b3","d8f6","e4e5","f6g6","f1e1","g8e7",
+    "c1a3","b7b5","b3b5","a8b8","b5a4","a5b6","b1d2","c8b7","d2e4","g6f5",
+    "c4d3","f5h5","e4f6","g7f6","e5f6","h8g8","a1d1","h5f3","e1e7","c6e7",
+    "a4d7","e8d7","d3f5","d7e8","f5d7","e8f8","a3e7",
+};
+
+// the opera game, morphy vs duke of brunswick and count isouard, paris 1858, ends in mate on move 17
+static const char *OPERA_MOVES[] = {
+    "e2e4","e7e5","g1f3","d7d6","d2d4","c8g4","d4e5","g4f3","d1f3","d6e5",
+    "f1c4","g8f6","f3b3","d8e7","b1c3","c7c6","c1g5","b7b5","c3b5","c6b5",
+    "c4b5","b8d7","e1c1","a8d8","d1d7","d8d7","h1d1","e7e6","b5d7","f6d7",
+    "b3b8","d7b8","d1d8",
+};
+
+// the game of the century, byrne vs fischer, new york 1956, ends in mate on move 41
+static const char *CENTURY_MOVES[] = {
+    "g1f3","g8f6","c2c4","g7g6","b1c3","f8g7","d2d4","e8g8","c1f4","d7d5",
+    "d1b3","d5c4","b3c4","c7c6","e2e4","b8d7","a1d1","d7b6","c4c5","c8g4",
+    "f4g5","b6a4","c5a3","a4c3","b2c3","f6e4","g5e7","d8b6","f1c4","e4c3",
+    "e7c5","f8e8","e1f1","g4e6","c5b6","e6c4","f1g1","c3e2","g1f1","e2d4",
+    "f1g1","d4e2","g1f1","e2c3","f1g1","a7b6","a3b4","a8a4","b4b6","c3d1",
+    "h2h3","a4a2","g1h2","d1f2","h1e1","e8e1","b6d8","g7f8","f3e1","c4d5",
+    "e1f3","f2e4","d8b8","b7b5","h3h4","h7h5","f3e5","g8g7","h2g1","f8c5",
+    "g1f1","e4g3","f1e1","c5b4","e1d1","d5b3","d1c1","g3e2","c1b1","e2c3",
+    "b1c1","a2c2",
+};
+
+// deep blue vs kasparov, new york 1997 game 6, kasparov resigned after move 19
+static const char *DEEPBLUE_MOVES[] = {
+    "e2e4","c7c6","d2d4","d7d5","b1c3","d5e4","c3e4","b8d7","e4g5","g8f6",
+    "f1d3","e7e6","g1f3","h7h6","g5e6","d8e7","e1g1","f7e6","d3g6","e8d8",
+    "c1f4","b7b5","a2a4","c8b7","f1e1","f6d5","f4g3","d8c8","a4b5","c6b5",
+    "d1d3","b7c6","g6f5","e6f5","e1e7","f8e7","c2c4",
+};
+
 const FamousGame_t FAMOUS_GAMES[] = {
-    { "Immortal Game", IMMORTAL_MOVES, (int)(sizeof(IMMORTAL_MOVES)/sizeof(IMMORTAL_MOVES[0])) },
+    { "Immortal", IMMORTAL_MOVES, (int)(sizeof(IMMORTAL_MOVES)/sizeof(IMMORTAL_MOVES[0])), "Anderssen v Kieseritzky" },
+    { "Evergreen", EVERGREEN_MOVES, (int)(sizeof(EVERGREEN_MOVES)/sizeof(EVERGREEN_MOVES[0])), "Anderssen v Dufresne" },
+    { "Opera Game", OPERA_MOVES, (int)(sizeof(OPERA_MOVES)/sizeof(OPERA_MOVES[0])), "Morphy v Brunswick" },
+    { "Century", CENTURY_MOVES, (int)(sizeof(CENTURY_MOVES)/sizeof(CENTURY_MOVES[0])), "Byrne v Fischer" },
+    { "Deep Blue", DEEPBLUE_MOVES, (int)(sizeof(DEEPBLUE_MOVES)/sizeof(DEEPBLUE_MOVES[0])), "Deep Blue v Kasparov" },
 };
 const int FAMOUS_GAME_COUNT = (int)(sizeof(FAMOUS_GAMES) / sizeof(FAMOUS_GAMES[0]));
 

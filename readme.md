@@ -6,7 +6,7 @@
 ![FreeRTOS](https://img.shields.io/badge/RTOS-FreeRTOS-green)
 ![KiCad](https://img.shields.io/badge/PCB-KiCad%2010-orange)
 ![Language](https://img.shields.io/badge/firmware-C%2B%2B%20(Arduino%20core)-lightgrey)
-![Status](https://img.shields.io/badge/status-working%20prototype-yellow)
+![Status](https://img.shields.io/badge/status-working-brightgreen)
 
 Built for the Microcontroller Lab at Texas Tech University, Summer 2026, as a three-person group project. Inspired by commercial boards like ChessUp 2.
 
@@ -34,15 +34,16 @@ You move a real piece. Magnets in the piece bases trigger a sensor under each sq
 
 | Mode | What happens |
 |---|---|
-| **Local Game** | Two people play over the board. Untimed or with a clock preset (up to 30+0). Detects checkmate, stalemate, and the 50-move draw. |
+| **Local Game** | Two people play over the board. Untimed or with a clock preset (up to 30+0). Detects checkmate, stalemate, the 50-move draw, and flagging on timed games. |
 | **Online Game** | Seeks a human opponent on Lichess (1+0 up to 15+10, rated or casual). Your moves are sent for you, and the opponent's moves are lit on the board for you to replay. |
 | **Play Bot** | Challenges Lichess Stockfish, level 1 to 8, with a chosen clock (or untimed) and color (white, black, random). |
-| **Famous Games** | Step-through study mode. One game is stored on the device: the Immortal Game (Anderssen vs Kieseritzky, 1851). |
+| **Famous Games** | Step-through study mode with five classic games stored on the device: the Immortal Game (Anderssen v Kieseritzky, 1851), the Evergreen Game (Anderssen v Dufresne, 1852), the Opera Game (Morphy, 1858), the Game of the Century (Byrne v Fischer, 1956), and Deep Blue v Kasparov (1997, game 6). The board shows each move and waits for you to play it. |
 | **WiFi Setup** | Re-opens the phone-based setup page to change WiFi credentials or the Lichess token. |
 
 Also in the box:
 
 - **Full rules on the device.** Castling, en passant, promotion (with an on-screen piece picker), and captures are all detected from sensor occupancy alone. There is no per-piece identification.
+- **Board error highlighting.** Move a piece out of turn, drop it on the wrong square, or disturb the board while waiting for an online opponent, and the offending squares light red along with where the piece should go back.
 - **Start-position check.** Before each game the LEDs light every square that is still missing a piece.
 - **Live match screen.** Opponent name and rating, both clocks, and a running-side indicator. Clocks tick locally and resync with the server.
 - **Leave-game prompt.** Cancel mid-game opens a confirm. On a Lichess game that resigns (or aborts, early on). On a local game it just drops back to the menu.
@@ -191,6 +192,7 @@ ChessLink/
     board_map.h                square-to-LED mapping
     PIN_MAP.md                 firmware to PCB pin map
     FILE_REFERENCE.md          per-file design notes
+    BUILD_AND_FLASH.md         IDE setup, board settings, flashing, troubleshooting
   pcb/
     ChessLink_Footprints.pretty/   custom KiCad footprints
     ChessLink_Symbols/             custom KiCad symbols
@@ -236,16 +238,11 @@ The setup access point uses a fixed default password, defined in `chesslink.h`. 
 
 ## Known limitations
 
-This is a working prototype, not a finished product.
+Things this build does not do:
 
 - **No automated tests are committed.** The engine and move-detection logic were checked during development, but no test suite is in this repo.
-- **No board-desync recovery.** If a piece is knocked over or misplaced mid-game, there is no "restore the board" state yet. If Lichess rejects a move, the failure is logged but not reverted.
-- **One stored study game.** Famous Games contains only the Immortal Game.
-- **Game-end detection is partial.** Local games detect checkmate, stalemate, and the 50-move rule. Threefold repetition and insufficient material are not detected on the device. Online games take the result from Lichess.
 - **LED brightness is conservative.** It is set to 48 of 255 pending a thermal check of the full 64-LED load.
-- **Piece magnets can interact.** Prototype pieces with several stacked magnets showed interference at roughly 50 to 60 mm separation. Using a single magnet per piece was being evaluated.
-- **Some docs in `rtos/chesslink/` are stale.** `BUILD_AND_FLASH.md`, `INTEGRATION.md`, and `MERGE_NOTES.md` describe earlier iterations (older libraries, older pin assignments, files that no longer exist). The code, `PIN_MAP.md`, and this README are current.
-- **Not implemented, but sketched in `IMPLEMENTATION_ROADMAP.md`:** resume a game after reboot, persistent settings, king-in-check highlight, draw offers and takebacks, puzzle mode, OTA updates.
+- **Not implemented:** resuming a game after a reboot, persistent settings, a check highlight, draw offers and takebacks, puzzle mode, and OTA updates.
 
 ---
 
@@ -265,4 +262,4 @@ ChessLink was a group project by **Gabriel Cooper**, **Aaron Luebbert**, and **N
 
 My part (Aaron): the PCB design in KiCad (schematics, custom footprints and symbols, layout, production files and ordering), the FreeRTOS firmware architecture and integration, and hardware bring-up and debugging. The WiFi captive-portal page and the menu and Stockfish-picker layout began as teammates' prototypes and were folded into this firmware.
 
-Thanks to Jordie Bellar, a lab student, for hands-on help along the way.
+Thanks to Jordie Bellar, for all the help and inspiration.

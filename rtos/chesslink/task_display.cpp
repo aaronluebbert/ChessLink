@@ -424,8 +424,11 @@ static void render_famous(const GameState_t *gs) {
         tft.drawRect(8, y, D_W - 16, 36, sel ? C_ACCENT : C_LIGHT_GRAY);
         tft.setTextColor(sel ? C_ACCENT : C_LIGHT_GRAY);
         tft.setTextSize(2);
-        tft.setCursor(20, y + 10);
+        tft.setCursor(20, y + 4);
         tft.print(FAMOUS_GAMES[i].name);
+        tft.setTextSize(1);
+        tft.setCursor(20, y + 24);
+        tft.print(FAMOUS_GAMES[i].detail);
     }
 
     tft.setTextColor(C_DIM);

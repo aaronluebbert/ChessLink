@@ -1,339 +1,145 @@
-# ChessLink firmware -- file reference
+# ChessLink firmware file reference
 
-A per-file description of the ChessLink RTOS firmware, detailed enough to
-reconstruct any file from scratch. It is an ESP32 (Arduino core) FreeRTOS app: a
-physical chessboard with 64 hall sensors (read through an HC165 shift-register
-chain), a WS2812B LED under each square, an ST7789 LCD, four buttons, and a
-WiFi/Lichess link. It plays local games, online rated human games, and games
-against Stockfish.
+A guide to each source file in `rtos/chesslink/`. The firmware is an ESP32 (Arduino core) FreeRTOS application for a physical chessboard with 64 Hall-effect sensors read through a shift-register chain, a WS2812B LED under each square, an ST7789 LCD, four buttons, and a WiFi link to Lichess. It plays local games, online games against humans, games against Stockfish, and a step-through study mode for famous games.
 
---------------------------------------------------------------------------------
-## Architecture at a glance
+Related docs: [`PIN_MAP.md`](PIN_MAP.md) for wiring, [`BUILD_AND_FLASH.md`](BUILD_AND_FLASH.md) for building.
 
-Six FreeRTOS tasks talk only through queues -- no shared mutable globals across
-tasks except a few file-static caches inside a single task. `task_game` is the
-brain; every other task is an I/O edge.
+---
+
+## Architecture
+
+Six FreeRTOS tasks communicate only through queues. `task_game` is the brain, and every other task is an I/O edge.
 
 ```
- [task_Sensor] --BoardState--> [task_Game] --GameState--> [task_Display]
-                                  |   ^  \--LedCmd------> [task_Led]
- [task_Buttons]--ButtonEvent-----/   |
-                                     |  NetUpdate (clocks/players/status/result)
- [task_Network] <--NetCmd-- [task_Game]   ^
-       |  \--OpponentMove--> [task_Game]  |
-       \----------------------------------/
-       ^--PlayerMove-- [task_Game]
+ SensorScan --BoardState--> GameLogic --GameState--> LcdDisplay
+                              |  ^  \---LedCmd-----> LedControl
+ Buttons ---ButtonEvent------/   |
+                                 |  NetUpdate (clocks, players, status, result, server position)
+ Network <---NetCmd--- GameLogic ^
+    |  \--OpponentMove--> GameLogic
+    ^----PlayerMove------ GameLogic
 ```
 
-Cores/priorities (from `chesslink.h`): sensor, LED, game, buttons on core 1;
-network and display on core 0 (they share the core with WiFi/TCP system tasks).
-Priorities high-to-low: sensor 5, LED 4, game 3, buttons 3, network 2, display 1.
+| Task | Core | Priority | Stack |
+|---|---|---|---|
+| SensorScan | 1 | 5 | 4096 |
+| LedControl | 1 | 4 | 4096 |
+| GameLogic | 1 | 3 | 8192 |
+| Buttons | 1 | 3 | 2048 |
+| Network | 0 | 2 | 16384 |
+| LcdDisplay | 0 | 1 | 8192 |
 
-Canonical square index used everywhere: `sq = rank*8 + file`, a1=0 .. h8=63
-(file 0=a..7=h, rank 0=1st..7=8th). Board occupancy is a `uint64_t` bitmask,
-bit `sq` set = a piece is on that square.
+Sensor, LED, game, and button tasks run on core 1. Network and display run on core 0, which also hosts the ESP32 WiFi and TCP system tasks.
 
---------------------------------------------------------------------------------
+Canonical square index, used everywhere: `sq = rank * 8 + file`, with a1 = 0 and h8 = 63. Board occupancy is a `uint64_t` bitmask where bit `sq` set means a piece is on that square.
+
+---
+
 ## chesslink.ino
-Arduino entry stub. Contains only a comment and `#include "chesslink.h"`. The
-Arduino IDE compiles every `.cpp` in the folder; the real `setup()`/`loop()` live
-in `main.cpp`. The sketch folder and this file must share the name `chesslink`.
 
---------------------------------------------------------------------------------
+Arduino entry stub. It includes `chesslink.h` and nothing else. The real `setup()` and `loop()` are in `main.cpp`.
+
 ## main.cpp
-Owns the queue handle definitions and `setup()`/`loop()`.
 
-Defines (one instance each) all eight `QueueHandle_t` globals declared `extern`
-in `chesslink.h`: `xQ_BoardState`, `xQ_LedCmd`, `xQ_GameState`, `xQ_PlayerMove`,
-`xQ_OpponentMove`, `xQ_ButtonEvent`, `xQ_NetCmd`, `xQ_NetUpdate`.
+Defines the eight queue handles and the shared SPI mutex, then starts everything.
 
-`setup()`: `Serial.begin(115200)`; `chess_engine_init()` (builds attack tables
-before any task runs); create the eight queues with the depths and item sizes
-from `chesslink.h` (`xQ_NetCmd` carries `NetCmdMsg_t`, `xQ_NetUpdate` carries
-`NetUpdate_t`, etc.); if any queue is null, print fatal and spin forever; then
-`xTaskCreatePinnedToCore` the six tasks with the stack/priority/core macros.
-Order: sensor, LED, game, buttons on core 1; display, network on core 0.
+`setup()` starts the serial port at 115200, calls `chess_engine_init()` to build the attack tables, creates the eight queues with the depths and item sizes from `chesslink.h`, halts with a message if any allocation fails, and pins the six tasks to their cores. `loop()` just sleeps, since all work happens in tasks.
 
-`loop()`: `vTaskDelay(portMAX_DELAY)` -- everything runs in tasks.
+Queues: `xQ_BoardState`, `xQ_LedCmd`, `xQ_GameState`, `xQ_PlayerMove`, `xQ_OpponentMove`, `xQ_ButtonEvent`, `xQ_NetCmd`, `xQ_NetUpdate`. `xQ_GameState` has depth 1 and is written with `xQueueOverwrite`, so the display always sees the latest state.
 
---------------------------------------------------------------------------------
 ## chesslink.h
-The shared contract: pins, RTOS config, all cross-task data types, queue externs,
-task prototypes, and the online/bot config tables. This is the most important
-file to get right; everything else depends on it.
 
-Pins (`#define`): the LCD and shift registers share the ESP32 VSPI bus --
-`SR_SCLK`/`LCD_SCLK 18` (SCK), `SR_MISO 19` (MISO, SR data), `LCD_MOSI 23` (MOSI,
-LCD data); `SR_LOAD 5` is the SR latch. LCD control: `LCD_CS 15`, `LCD_DC 2`,
-`LCD_RST 4`, `LCD_BL 32`. LEDs `LED_DATA_PIN 25` (WS2812B via a 74AHCT125 level
-shifter). Both tasks hold `xSPI18Mutex` around bus access. Buttons (input-only,
-external 10k pull-ups, active-low): `BTN_UP 36`, `BTN_DOWN 39`, `BTN_CONFIRM 34`,
-`BTN_CANCEL 35`.
+The shared contract: pins, task configuration, cross-task types, queue externs, and the preset tables.
 
-`NUM_SQUARES 64`. Stack sizes (`STACK_SENSOR 4096` ... `STACK_NETWORK 8192`),
-priorities (`PRI_*`), cores (`CORE_*`), queue depths (`Q_*_DEPTH`, mostly 4-8),
-and timing (`SENSOR_SCAN_MS 20`, `LED_UPDATE_MS 16`, `BTN_POLL_MS 20`,
-`BTN_DEBOUNCE_MS 50`, `DEBOUNCE_SCANS 3`).
+- **Pins and timing.** See `PIN_MAP.md`. Sensor scan every 20 ms, LED refresh every 16 ms, button poll every 20 ms with a 50 ms debounce, and 3 identical sensor scans required to accept a change.
+- **Modes.** `GameMode_t`: idle, local, lichess (online and bot), and replay (study mode).
+- **Screens.** `UiScreen_t`: menu, online config, bot config, local config, famous games list, game, WiFi setup, notice, leave-game confirm, game over.
+- **Menu.** Five items in order: Local Game, Online Game, Play Bot, Famous Games, WiFi Setup.
+- **Config rows.** Online: time, rated, start. Bot: level (1 to 8), time, color, start. Local: time, start.
+- **Presets.** `TimePreset_t` tables for online (1+0 to 15+10), bot (untimed to 15+10), and local (untimed to 30+0).
+- **Famous games.** `FamousGame_t` holds a short name, a UCI move list, a move count, and a one-line players description.
+- **Network messages.** `NetCmd_t`: start online, start bot, resign, open setup, import. `NetCmdMsg_t` carries the game parameters. `NetStatus_t`: setup, connecting, online. `NetUpdate_t` carries status, result text, player names and ratings, clocks, and an authoritative position (FEN) with the last move, each gated by a `has_*` flag.
+- **State snapshots.** `GameState_t` is what the display renders: mode, FEN, side to move, last move, status text, current screen, menu and config cursors, clocks, player info, and promotion picker state. `MoveEvent_t` carries a move (and clocks, on opponent events) between the game and network tasks.
+- **Setup access point.** `WIFI_SETUP_AP_SSID` and `WIFI_SETUP_AP_PASS`.
 
-Enums and structs (exact fields matter -- queues copy by value):
-- `BoardState_t { uint64_t occupied; }` -- one sensor scan.
-- `LedCmdType_t { LED_CMD_SET_SQUARE, LED_CMD_CLEAR, LED_CMD_PATTERN, LED_CMD_HILITE }`.
-- `LedCmd_t { LedCmdType_t type; uint8_t square; uint8_t r,g,b; uint64_t mask; }`.
-- `ButtonEvent_t { BTN_EVT_UP, BTN_EVT_DOWN, BTN_EVT_CONFIRM, BTN_EVT_CANCEL }`.
-- `PromoState_t { PROMO_NONE, PROMO_SELECTING }`.
-- `GameMode_t { GAME_MODE_IDLE, GAME_MODE_LOCAL, GAME_MODE_LICHESS }`.
-- `UiScreen_t { UI_MENU, UI_ONLINE_CFG, UI_BOT_CFG, UI_GAME, UI_SETUP, UI_NOTICE, UI_CONFIRM, UI_GAMEOVER }`.
-- Menu items: `MENU_ITEM_COUNT 4`, `MENU_ITEM_LOCAL/ONLINE/BOT/SETUP = 0..3`.
-- Soft-AP: `WIFI_SETUP_AP_SSID "ChessLink-Setup"`, `WIFI_SETUP_AP_PASS "chesslink12"`.
-- `TimePreset_t { uint16_t min; uint8_t inc; const char *label; }`; externs
-  `ONLINE_TIME_PRESETS[]`/`ONLINE_TIME_COUNT` and `BOT_TIME_PRESETS[]`/`BOT_TIME_COUNT`
-  (defined in task_game.cpp).
-- Online config rows: `CFG_ROW_TIME 0`, `CFG_ROW_RATED 1`, `CFG_ROW_START 2`, `CFG_ROW_COUNT 3`.
-- Bot config rows: `BOT_ROW_LEVEL 0`, `BOT_ROW_TIME 1`, `BOT_ROW_COLOR 2`, `BOT_ROW_START 3`, `BOT_ROW_COUNT 4`; `BOT_LEVEL_MIN 1`, `BOT_LEVEL_MAX 8`.
-- `NetCmd_t { NET_CMD_START_ONLINE, NET_CMD_START_BOT, NET_CMD_RESIGN, NET_CMD_OPEN_SETUP }`.
-- `NetCmdMsg_t { NetCmd_t type; uint16_t time_min; uint8_t inc_sec; bool rated; uint8_t level; uint8_t color; }` -- game->network command (color 0=white/1=black/2=random).
-- `NetStatus_t { NET_STATUS_SETUP, NET_STATUS_ONLINE }`.
-- `NetUpdate_t` -- network->game status/meta/clock/result push. Flags gate each
-  block: `has_status`+`status`; `has_result`+`result_text[32]`;
-  `has_meta`+`my_name[20]`/`opp_name[20]`/`my_rating`/`opp_rating`/`my_color`;
-  `has_clocks`+`white_clock_ms`/`black_clock_ms`.
-- `GameState_t` -- game->display snapshot: `mode`, `fen[92]`, `active_color`,
-  `last_move[6]`, `status_msg[32]`, `ui_screen`, `menu_cursor`, config fields
-  (`cfg_cursor`/`cfg_time_idx`/`cfg_rated`/`cfg_level`/`cfg_color`),
-  `white_clock_ms`/`black_clock_ms`, player meta (`my_name`/`opp_name`/
-  `my_rating`/`opp_rating`/`my_color`), `promo_state`, `promo_cursor`.
-- `MoveEvent_t { uint8_t from_sq, to_sq; char uci[6]; uint32_t white_clock_ms, black_clock_ms; }` -- carried on `xQ_PlayerMove` and `xQ_OpponentMove` (clocks only meaningful on opponent events).
-
-Queue externs, `extern SemaphoreHandle_t xSPI18Mutex;` (guards the shared GPIO18
-clock), and the six task prototypes. Also `void chess_engine_init();`.
-
-Note: clocks are stored as absolute remaining ms; the server value already
-includes increment, so increments are intentionally not tracked.
-
---------------------------------------------------------------------------------
 ## board_map.h
-Two pure inline helpers mapping physical wiring to canonical squares. From the
-validated hardware:
-- `cl_led_index(sq)` -> WS2812B chain position. Chain order is LED 0 = h8, then
-  h..a across each rank, ranks 8..1: `return (7 - (sq>>3))*8 + (7 - (sq&7));`.
-- `cl_sensor_sq(readidx)` -> canonical square. The HC165 chain clocks out in
-  canonical order a1,b1..h1,a2..h8, so this is the identity: `return readidx;`.
 
---------------------------------------------------------------------------------
-## chess_engine.h / chess_engine.cpp
-A self-contained bitboard move generator and rules engine. No Arduino/RTOS deps
-beyond `<Arduino.h>` for `uint*` types, so it host-compiles and unit-tests.
+`cl_led_index(sq)` maps a canonical square to its position in the WS2812B chain. LED 0 is h8, and the chain runs h to a across each rank, ranks 8 down to 1: `(7 - rank) * 8 + (7 - file)`. The sensor read order is handled inside `task_sensor.cpp`.
 
-Header defines: `BB` (uint64_t); file masks `FILE_A/B/G/H`; rank masks
-`RANK_1..RANK_8` (all eight -- `RANK_3`/`RANK_6` must be here, they are used by
-pawn double-push generation); `SQ/FILE_OF/RANK_OF/BB_SQ` macros; `PieceType
-{ PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING, NO_PIECE }`; `Color { WHITE, BLACK,
-NO_COLOR }`, `OTHER(c)`; castling bits `CASTLE_WK/WQ/BK/BQ`; `Move` (uint32_t)
-with bit layout from/to/piece/capture/promo/ep/castle and the `MV_*` accessors +
-`make_move(...)` builder; `MAX_MOVES 218`; and `Position` (per-color piece
-bitboards `pieces[2][6]`, `occupied[2]`, `all`, `side`, `castling`, `ep_sq`,
-`halfmove`, plus per-square `board[64]`/`color_at[64]` lookups).
+---
 
-Public API (all defined once in the .cpp): `pos_from_fen`, `pos_to_fen`,
-`gen_legal_moves`, `gen_legal_moves_from`, `legal_destinations`, `in_check`,
-`make_move_pos(pos,m,undo)` (undo is a full-state scratch save; callers that
-don't unmake still must pass one), `unmake_move_pos`, `uci_to_move`, `move_to_uci`,
-`chess_engine_init`.
+## chess_engine.h and chess_engine.cpp
 
-.cpp sections in order: attack tables (`init_attack_tables`, ray/rook/bishop/queen
-attacks); `sq_attacked_by`/`in_check`; FEN in/out; `make_move_pos`/`unmake_move_pos`
-(make handles captures, en passant removal, promotion, castling rook move,
-castling-right updates, ep-target set, halfmove clock, and rebuilds `pos->all`);
-pseudo-legal generation `gen_pseudo`; legal filtering (make/`in_check`/unmake) in
-`gen_legal_moves`, `gen_legal_moves_from`, `legal_destinations`; UCI helpers;
-`chess_engine_init` (calls `init_attack_tables`). Occupancy after any legal move
-is authoritative in `Position::all` -- the game task relies on this.
+A self-contained bitboard rules engine with no RTOS dependencies.
 
---------------------------------------------------------------------------------
-## task_sensor.cpp  (task_SensorScan)
-Reads the 64-sensor HC165 chain over the shared VSPI bus and posts a debounced
-occupancy bitmask.
+- **Position.** Per-color piece bitboards, occupancy, side to move, castling rights, en passant square, halfmove clock, and per-square lookup arrays.
+- **Move encoding.** A `Move` packs from, to, piece, capture, promotion, en passant, and castling into 32 bits.
+- **API.** `pos_from_fen`, `pos_to_fen`, `gen_legal_moves`, `gen_legal_moves_from`, `legal_destinations`, `in_check`, `make_move_pos`, `unmake_move_pos`, `uci_to_move`, `move_to_uci`, `move_to_san`, and `chess_engine_init`.
+- **Generation.** Pseudo-legal moves are generated per piece, then filtered by making each move and checking whether the mover's king is attacked.
+- **Make move.** Handles captures, en passant removal, promotion, the castling rook move, castling-right updates, the en passant target, and the halfmove clock, and rebuilds `pos->all`.
 
-`SR_LOAD` is a plain GPIO latch (idle high); `SR_SCLK`/`SR_MISO` belong to VSPI
-(`SPI.begin` runs in `main`). `sr_read_all()` pulses `SR_LOAD` low->high to latch,
-then `SPI.beginTransaction(1MHz, MSBFIRST, SPI_MODE0)` and reads 8 bytes with
-`SPI.transfer(0)`. Unpack: byte `b` = rank `b`; within a byte MSB..LSB = file
-a..h; active-low (0 = occupied), so `occupied |= 1<<(b*8+f)` when bit `(7-f)` is 0.
-Loop: take `xSPI18Mutex` (GPIO18 shared with the LCD), `sr_read_all()`, give it;
-require `DEBOUNCE_SCANS` identical reads before accepting a change; on a change
-build `BoardState_t {occupied}` and `xQueueSend(xQ_BoardState)` (drop oldest if
-full); `vTaskDelayUntil` every `SENSOR_SCAN_MS`.
+`move_to_san` is used to build the movetext when a finished game is sent to Lichess for analysis.
 
---------------------------------------------------------------------------------
-## task_led.cpp  (task_LedControl)
-Drives the WS2812B strip via FastLED. `CRGB leds[NUM_SQUARES]`; `sq_to_led(sq)`
-returns `cl_led_index(sq)`. `apply_led_cmd` handles: `SET_SQUARE` (one square to
-rgb), `CLEAR` (`FastLED.clear()`), `PATTERN` (masked squares full rgb, others at
-~10% for context), `HILITE` (masked squares rgb, all others off -- used by the
-setup-board guide). Task: `addLeds<WS2812B, LED_DATA_PIN, GRB>`,
-`setBrightness(48)`, then a loop that drains `xQ_LedCmd`, caps `FastLED.show()` to
-~60fps (`LED_UPDATE_MS`), and blocks up to one frame for the next command.
+---
 
---------------------------------------------------------------------------------
-## task_buttons.cpp  (task_Buttons)
-Debounces four active-low buttons. Arrays `pins[4] = {BTN_UP,BTN_DOWN,BTN_CONFIRM,
-BTN_CANCEL}` and `evts[4] = {BTN_EVT_UP,...}`. Per button tracks last raw / debounced
-state / `stable_since`. Init each pin `INPUT` and seed state so nothing fires at
-boot. Loop every `BTN_POLL_MS`: on a raw change reset the stable timer; once stable
-for `BTN_DEBOUNCE_MS` and the debounced state actually changed, fire the event only
-on the falling edge (HIGH->LOW press) via `xQueueSend(xQ_ButtonEvent)`.
+## task_sensor.cpp
 
---------------------------------------------------------------------------------
-## task_game.cpp  (task_GameLogic)  -- the brain
-Owns all game/UI state in a local `GameCtx_t` and publishes `GameState_t`. Never
-touches hardware directly; talks through queues.
+Reads the 64-sensor shift-register chain and publishes a debounced occupancy bitmask.
 
-Preset tables (definitions of the header externs): `ONLINE_TIME_PRESETS[]`
-(1+0 .. 15+10, default index 4 = 5+3) and `BOT_TIME_PRESETS[]` (Untimed, 3+2, 5+3,
-10+0, 15+10; default index 2). `CAND_MAX 40`.
+A scan pulses `SR_LOAD` to latch the sensors, reads the first bit (a1) directly from the data line, then clocks the remaining bits in over VSPI at 1 MHz and shifts them into place. Sensors are active-low. The read holds `xSPI18Mutex` so an LCD write cannot interleave with it. A change must appear in 3 consecutive scans before it is sent on `xQ_BoardState`, and if the queue is full the oldest entry is dropped.
 
-`GameCtx_t` holds: `Position pos`; `mode`; `status_msg`/`last_move`; UI flags
-`in_menu`/`in_setup`/`in_notice`/`in_online_cfg`/`in_bot_cfg`/`confirm_exit`;
-`menu_cursor`; config `cfg_cursor`/`cfg_time_idx`/`cfg_rated`/`cfg_level`/`cfg_color`;
-clocks `white_clock_ms`/`black_clock_ms`; player meta `my_name`/`opp_name`/
-`my_rating`/`opp_rating`/`my_color`; `last_occupied` (cached sensor bitmask);
-move-detection `phase`, `lifted_sq`, `promo_to_sq`, `legal_dests`, candidate arrays
-`cand_moves[CAND_MAX]`/`cand_occ[CAND_MAX]`/`cand_count`, `promo_cursor`.
+## task_led.cpp
 
-`MovePhase_t { PHASE_SETUP_BOARD, PHASE_IDLE, PHASE_PIECE_LIFTED, PHASE_PROMO_SELECT,
-PHASE_OPP_SYNC, PHASE_GAME_OVER }`.
+Drives the WS2812B strip with FastLED. It handles four commands: set one square to a color, clear, pattern (masked squares at full color and the rest dimmed), and highlight (masked squares lit, all others off). It drains pending commands before each refresh and caps `FastLED.show()` at about 60 fps. Brightness is set to 48 out of 255.
 
-`publish_game_state(ctx)`: copies ctx into a `GameState_t`, computes `ui_screen`
-by priority: setup > confirm_exit > menu > online_cfg > bot_cfg > game_over >
-notice > else game; `xQueueOverwrite(xQ_GameState)`.
+## task_buttons.cpp
 
-Mode entry: `enter_menu` (resets all UI flags, mode IDLE); `check_setup(ctx,occ)`
-(if `occ == pos.all` go PHASE_IDLE + "your move", else `LED_CMD_HILITE` the
-squares still missing a piece = `pos.all & ~occ`); `start_local` (load startpos,
-PHASE_SETUP_BOARD, run check against `last_occupied`); `open_online_cfg`/`open_bot_cfg`
-(reset the shared `cfg_time_idx` to that mode's default); `start_lichess_game`
-(shared: notice "Seeking.../Starting bot...", mode LICHESS, send the `NetCmdMsg`);
-`start_online`/`start_bot` (build the `NetCmdMsg` from the config and call it);
-`open_setup` (send `NET_CMD_OPEN_SETUP`, show setup screen); `leave_game`
-(local -> enter_menu; lichess -> notice + `NET_CMD_RESIGN`).
+Debounces four active-low buttons (up, down, confirm, cancel) and posts a `ButtonEvent_t` on each press, on the falling edge, once the level has been stable for the debounce time.
 
-Game over: `end_game(ctx,text)` sets `status_msg`, clears notice, PHASE_GAME_OVER,
-publishes. `check_local_end` (local only, after each move): no legal reply ->
-checkmate (names winner) or stalemate; else `halfmove>=100` -> 50-move draw.
+---
 
-Move detection by expected occupancy: `occ_after_move(pos,m)` = `pos.all` after a
-scratch make. `begin_move(ctx,from)` gathers `gen_legal_moves_from` and precomputes
-each candidate's resulting occupancy. `process_board_change(ctx,bs)` early-returns
-for promo/game-over/notice/confirm; `PHASE_SETUP_BOARD` -> `check_setup`;
-`PHASE_OPP_SYNC` -> wait until `curr == pos.all` then resume; `PHASE_IDLE` -> a
-lifted square of the side to move starts a move (`begin_move`); `PHASE_PIECE_LIFTED`
--> if `curr` equals a candidate occupancy, commit it (or open the promo picker if
-`MV_IS_PROMO`), if `curr == prev` cancel, else if a single own piece landed on a
-non-legal square flash red. This is what makes captures/castling/en passant work.
+## task_game.cpp
 
-`commit_move(ctx,chosen)`: make the move on `pos`, set last move/status, green
-flash, if LICHESS send `MoveEvent_t` on `xQ_PlayerMove`, publish, brief delay,
-clear LEDs, then `check_local_end` for local games.
+Owns all game and UI state in one context struct and publishes `GameState_t` snapshots. It never touches hardware directly.
 
-`promo_hint`/`commit_promo` support the promotion picker.
+**Phases.** `PHASE_SETUP_BOARD` (waiting for the start position), `PHASE_IDLE`, `PHASE_PIECE_LIFTED`, `PHASE_PROMO_SELECT`, `PHASE_OPP_SYNC` (waiting for the player to replay an opponent move), `PHASE_REPLAY` (study mode), and `PHASE_GAME_OVER`.
 
-`handle_button(ctx,evt)` routes by state: setup/notice ignore; `confirm_exit`
-(CONFIRM=leave, CANCEL=resume); game-over (any button -> menu); menu (UP/DOWN
-cursor, CONFIRM opens local/online-cfg/bot-cfg/setup); online cfg (UP/DOWN row,
-CONFIRM cycles time/toggles rated/starts, CANCEL back); bot cfg (level/time/color
-rows + start); promo picker (UP/DOWN cycle piece, CONFIRM commit); otherwise
-in-game CANCEL opens the leave prompt.
+**Start position check.** Before every game, squares that should hold a piece but do not are lit green. Play starts when the sensors match the starting occupancy.
 
-`apply_opponent_move(ctx,mv)`: make the move on `pos` (now ahead of the board),
-store clocks, light from(blue)/to(cyan), enter `PHASE_OPP_SYNC` (player must
-replay it). `apply_net_update(ctx,u)`: `has_result` -> `end_game`; `has_status`
-SETUP/ONLINE -> setup screen / return to menu; on the first meta/clocks after a
-seek, clear the notice and enter `PHASE_SETUP_BOARD`; copy meta/clocks and publish.
+**Move detection by expected occupancy.** When a piece of the side to move is lifted, `begin_move` generates the legal moves from that square, lights the destinations green and the source yellow, and precomputes the board occupancy each candidate move would produce. As the sensors change, the move is committed when the occupancy matches one candidate. Captures, castling, en passant, and promotion all fall out of this, because the whole board is compared. Pieces placed on squares that do not belong to the move are flagged red until corrected. Promotion opens a picker on the LCD.
 
-`task_GameLogic`: init ctx (default names, config defaults), `enter_menu`. Loop:
-read a button -> `handle_button`; always read `xQ_BoardState` and cache
-`last_occupied` (even in menu) and, when not in menu, `process_board_change`;
-skip the rest while in menu; take an opponent move only when `PHASE_IDLE` and not
-`confirm_exit`; always drain `xQ_NetUpdate`.
+**Board error highlighting.** If a piece is moved out of turn, dropped on the wrong square, or disturbed while waiting for an online opponent, the offending squares light red, along with where the piece should go back, and the status line explains what to fix.
 
---------------------------------------------------------------------------------
-## task_display.cpp  (task_LcdDisplay)
-Renders `GameState_t` on the ST7789 (170x320 portrait, USB-C at top,
-`setRotation(0)`). Hardware SPI on the shared VSPI bus: `Adafruit_ST7789(&SPI,
-LCD_CS, LCD_DC, LCD_RST)`. `LCD_LOCK()/LCD_UNLOCK()` wrap `xSPI18Mutex`, held
-around the init burst and every frame render (so a render isn't clocked apart by
-a sensor read). The task turns the backlight (`LCD_BL`) on *first*, before
-`tft.init` -- so a lit-but-blank panel points at init/data, not power. Palette
-`#define`s (C_BG, C_ACCENT, etc.). Board layout constants.
+**Online play.** Player moves are sent to the network task. Opponent moves arrive on `xQ_OpponentMove`, are applied to the position, lit blue (from) and cyan (to), and the game waits in `PHASE_OPP_SYNC` until the physical board matches. The server's position, rebuilt into a FEN by the network task, is adopted as truth through `reconcile_to_server`, so the on-device state cannot drift from the game. Syncs that arrive while a piece is lifted or during setup are deferred and applied afterward.
 
-Helpers: `fen_to_squares` (FEN piece-placement -> 64-char array);
-`draw_board_square`/`draw_mini_board` (8x8 with piece letters in circles);
-`print_centered(s,y,size,color)` (width = len*6*size); `fmt_clock(ms)` -> MM:SS
-(0 -> "--:--"); `fmt_rating` (0 -> "----").
+**Game end.** Local games detect checkmate, stalemate, the 50-move rule, and running out of time on timed games. Online games take the result from Lichess. A result screen shows the outcome, and any button returns to the menu. Finished games can be sent to Lichess for analysis (the game task builds the SAN movetext and stages it with `net_stage_import`).
 
-Screen renderers: `render_game_state` (header/turn/last-move/status/mini-board);
-`render_match_static` + `draw_match_clocks` (live match: opponent name+elo top,
-opponent clock, my clock, my name+elo bottom; running side green; clocks count
-down locally and resync on updates -- opponent up top, me at bottom, mapped via
-`my_color`); `render_menu` (four items); `render_online_cfg`/`render_bot_cfg`
-(config rows with a highlighted cursor and right-aligned values);
-`render_setup` (soft-AP join instructions); `render_notice(gs,terminal)` (centered
-message; terminal adds "press a button for the menu", transient adds "please
-wait..."); `render_confirm` ("Leave game? OK=yes CANCEL=no"); promotion picker
-(2x2 tiles, UP/DOWN choose, CONFIRM confirm) with `redraw_promo_tiles`.
+**Leave game.** Cancel mid-game opens a confirm prompt. Confirming resigns an online or bot game and ends a local game.
 
-Task: `tft.init(170,320)`, backlight on, splash (all under the lock), then a loop
-that receives a `GameState` (250ms timeout), takes the lock, calls `render_frame`,
-releases. `render_frame(gs, DispState*, got)` holds a `DispState` (current screen +
-cursors + clock baseline) and selects by `ui_screen`: SETUP, CONFIRM, NOTICE,
-GAMEOVER, MENU, ONLINE_CFG, BOT_CFG, or (in a game) PROMO if
-`promo_state==SELECTING`, MATCH if either clock is nonzero, else BOARD. When no
-new state arrives and a match is up, it ticks the running clock down locally from
-the last server value and redraws only the clock band.
+**Study mode.** `start_replay` loads a game from `FAMOUS_GAMES`, runs the normal board setup, then presents one scripted move at a time. The move is shown on the LEDs (blue and cyan) and the game waits until the board reaches the expected occupancy. Confirm toggles the hint, and cancel leaves. Wrongly disturbed squares light red.
 
---------------------------------------------------------------------------------
-## task_network.cpp  (task_Network)
-Owns WiFi, NVS credentials, and all Lichess Board-API traffic. Uses `WiFi`,
-`HTTPClient`, `ArduinoJson`, `Preferences`, `WebServer`, `DNSServer`.
+**Tables defined here.** The online, bot, and local time presets, and the famous games list (Immortal, Evergreen, Opera Game, Century, Deep Blue).
 
-Config/token: `LICHESS_BASE`. `lichess_token[96]` loaded from NVS namespace
-"wifi" key "token" by `load_lichess_token()`; `add_auth(http)` builds the
-`Bearer` header at runtime (nothing secret is compiled in). `net_report(status)`
-and `net_report_result(text)` push `NetUpdate_t`s; `s_game_ended` breaks the
-stream loop.
+Main loop: read a button, read the board state (always cached, even in the menu), take opponent moves only when the board is idle, always drain network updates, and check the local clock.
 
-Captive portal: `SETUP_PAGE` (PROGMEM HTML form for ssid/pass/token),
-`setup_handle_root`/`setup_handle_save` (writes NVS namespace "wifi"),
-`run_setup_portal()` (soft-AP `WIFI_SETUP_AP_SSID`, `DNSServer` wildcard,
-`WebServer`, reports `NET_STATUS_SETUP`, blocks until the form is submitted),
-`ensure_connected()` (try saved creds via `wifi_connect`, else run the portal;
-on success reload token and report `NET_STATUS_ONLINE`).
+---
 
-Lichess: `lichess_post_move` (POST a move UCI); `lichess_game_action`/`lichess_resign`
-(POST resign, fall back to abort); `count_moves`; `handle_stream_line` (parses
-`gameFull` -> player names/ratings + our color + initial clocks, tagging an
-`aiLevel` player as "Stockfish", pushes a meta+clock `NetUpdate`; `gameState` ->
-terminal status ends the game with a formatted result, else updates clocks and,
-if the opponent just moved, sends a `MoveEvent` on `xQ_OpponentMove`, otherwise
-re-syncs clocks); `lichess_stream_game` (opens the board game stream, each loop
-checks `xQ_NetCmd` for `NET_CMD_RESIGN`, flushes queued player moves via
-`lichess_post_move`, and feeds lines to `handle_stream_line` until game end or
-timeout); `lichess_seek_and_get_id` (POST board/seek with the online time control,
-reads `gameStart` for id + our color); `lichess_challenge_ai` (POST challenge/ai
-with level/color and, if timed, `clock.limit` in seconds + `clock.increment`;
-reads the id and our color from the response).
+## task_display.cpp
 
-`task_Network`: `ensure_connected()`, then loop reading `xQ_NetCmd`:
-`START_ONLINE` (set the seek params, seek, stream, report errors "No token"/"Seek
-failed"/"Connection lost"); `START_BOT` (challenge Stockfish, stream, "Bot start
-failed"); `OPEN_SETUP` (run the portal, reconnect). Reconnect on a dropped link.
+Renders `GameState_t` on the 170 by 320 ST7789. It uses the `Arduino_GFX_Library` (`Arduino_ESP32SPI` bus and `Arduino_ST7789` panel) on the shared VSPI bus, rotated 180 degrees so the USB-C port is at the top. Every render holds `xSPI18Mutex`. The backlight is switched on before the panel is initialized.
 
---------------------------------------------------------------------------------
-## Other docs in this folder
-- `IMPLEMENTATION_ROADMAP.md` -- what's done and what's left.
-- `PIN_MAP.md` -- firmware<->PCB pin map (authoritative for wiring).
-- `BUILD_AND_FLASH.md` -- Arduino IDE setup and flashing (note: its file list and
-  the LED pin are out of date; use this reference and `PIN_MAP.md` for current
-  truth).
-- `INTEGRATION.md` / `MERGE_NOTES.md` -- historical notes from an earlier merge
-  that referenced files since removed; kept only as history, not current.
+Screens: main menu, online config, bot config, local config, famous games list (name plus players line), WiFi setup instructions, transient notice (for example "Seeking opponent..."), leave-game confirm, game over, board view (mini board with piece letters in circles), live match view (opponent name and rating, both clocks, my name and rating), and the promotion picker.
+
+`render_frame` picks the screen from `ui_screen`, avoids redrawing static screens that are already shown, and while a match is showing it counts the running clock down locally between server updates.
+
+---
+
+## task_network.cpp
+
+Owns WiFi, stored credentials, and all Lichess traffic.
+
+- **Credentials.** SSID, password, and token live in NVS (`Preferences`, namespace `wifi`). Nothing secret is compiled in. The token is read at request time and sent as a bearer header.
+- **Setup portal.** With no saved WiFi, or on demand, the task starts the `ChessLink-Setup` access point with a wildcard DNS server and a web page that takes the SSID, password, and token, then connects and reports its status to the game task.
+- **Lichess calls.** Seek (`POST /api/board/seek`), stream a game (`GET /api/board/game/stream/{id}`), send a move, resign or abort, challenge Stockfish (`POST /api/challenge/ai`), and import a finished game (`POST /api/import`).
+- **Stream handling.** The first stream message gives player names, ratings, our color, and clocks, and tags a Stockfish opponent by name. Each later message carries the full move list. The task rebuilds the position from it with the engine, sends it up as an authoritative FEN with the last move, and forwards a move event when the opponent has just moved. Terminal statuses become a formatted result string from the player's point of view.
+- **Commands.** Start online, start bot, resign (read inside the stream loop), open setup, and import. Errors surface on the LCD as "No token", "Seek failed", "Connection lost", or "Bot start failed".

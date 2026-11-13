@@ -145,7 +145,9 @@ typedef enum {
 #define MENU_ITEM_SETUP  4
 
 // famous games (step-through study mode)
-typedef struct { const char *name; const char *const *moves; int count; } FamousGame_t;
+// famous game for the study list: short name (11 characters or fewer), UCI move list,
+// move count, and a one-line players description shown under the name
+typedef struct { const char *name; const char *const *moves; int count; const char *detail; } FamousGame_t;
 extern const FamousGame_t FAMOUS_GAMES[];
 extern const int          FAMOUS_GAME_COUNT;
 
